@@ -50,6 +50,7 @@ type Runtime struct {
 	stall      *stall.Tracker
 	stalled    map[string]string // node -> reason, this tick
 	lastWriter consul.WriterGTID // last-known writer executed set
+	lwDirty    bool              // lastWriter not yet published to Consul (retry until a leader write succeeds)
 }
 
 // Version is the build version shown in /status (set from main via ldflags).
@@ -591,17 +592,24 @@ func (r *Runtime) trackStalls(ctx context.Context, now time.Time, primary string
 	}
 	r.mu.Lock()
 	r.stalled = stalled
-	changed := false
 	if srcKnown && !po.st.ReadOnly && (r.lastWriter.Node != primary || r.lastWriter.Epoch != epoch || string(src) != r.lastWriter.Executed) {
 		r.lastWriter = consul.WriterGTID{Node: primary, Epoch: epoch, Executed: string(src), UpdatedAt: now}
-		changed = true
+		r.lwDirty = true
 	}
-	lw := r.lastWriter
+	lw, dirty := r.lastWriter, r.lwDirty
 	r.mu.Unlock()
-	if changed && r.lock.IsLeader() && r.cfg.Mode != config.ModeObserve {
+	// v0.2.7: publish whenever unpublished, not only on the tick that saw the change (the first change
+	// usually happens before this guard wins leadership, so the key was never written).
+	if dirty && lw.Node != "" && r.lock.IsLeader() && r.cfg.Mode != config.ModeObserve {
 		if err := r.store.PutWriterGTID(ctx, lw); err != nil {
 			r.log.Warn("publish last writer gtid", "err", err)
+			return
 		}
+		r.mu.Lock()
+		if r.lastWriter == lw {
+			r.lwDirty = false
+		}
+		r.mu.Unlock()
 	}
 }
 

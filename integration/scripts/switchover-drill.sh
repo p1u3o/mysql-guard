@@ -96,6 +96,7 @@ wait_for 30 "db-b reported running on all DB guards" sh -c "$(declare -f status 
 [ "$(status 9471 | jq '[.nodes[] | select(has("proxysql_status"))] | length')" = 0 ] || fail "proxysql_status shown without ProxySQL"
 [ "$(status 9473 | jq '.loops.renew_age_sec < 30')" = true ] || fail "witness renew age $(status 9473 | jq .loops.renew_age_sec)"
 for p in "${GUARDS[@]}"; do [ "$(status $p | jq -r '.version')" = drill ] || fail "guard $p version=$(status $p | jq -r .version)"; done
+wait_for 30 "writer/last-gtid published for db-a (v0.2.7)" sh -c '[ "$(docker compose exec -T consul consul kv get mysql/example/writer/last-gtid 2>/dev/null | jq -r .node)" = db-a ]'
 pass "drill 1: one leader ($(for p in "${GUARDS[@]}"; do echo -n "$p=$(status $p | jq -r .leader) "; done)), primary=db-a, epoch=$E0"
 
 check_roles() { # <primary> <replica>
@@ -118,6 +119,7 @@ write_row db-b post-switch
 wait_for 30 "post-switch row on db-a" row_on db-a post-switch
 wait_for 30 "GTIDs match" gtids_match
 snap 02-switchover
+wait_for 30 "writer/last-gtid published for db-b" sh -c '[ "$(docker compose exec -T consul consul kv get mysql/example/writer/last-gtid 2>/dev/null | jq -r .node)" = db-b ]'
 pass "drill 2: switchover db-a->db-b epoch $E->$(kv_epoch), gtid=$(gtid db-a)"
 
 log "=== Drill 3: switch back db-b -> db-a (act) ==="
@@ -237,6 +239,7 @@ log "=== Drill 9: slow START REPLICA on the old primary (3s driver readTimeout w
 PFLAGS=("${FLAGS[@]}")
 run_proxy() { docker compose exec -T -d guard-b sh -c "exec slowproxy -listen 127.0.0.1:3399 -target db-b:3306 -mode $1 -delay 6s > /tmp/slowproxy-$1.log 2>&1"; sleep 1; }
 stop_proxy() { docker compose exec -T guard-b sh -c 'kill $(pidof slowproxy) 2>/dev/null; true'; }
+lw_node() { docker compose exec -T consul consul kv get mysql/example/writer/last-gtid 2>/dev/null | jq -r .node 2>/dev/null; }
 nr_keys() { docker compose exec -T consul consul kv get -recurse mysql/example/guard/needs-rebuild/ 2>/dev/null | wc -l | tr -d ' '; }
 [ "$(nr_keys)" = 0 ] || fail "needs-rebuild keys present before drill 9"
 

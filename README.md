@@ -58,7 +58,7 @@ Admin updates match `mysql_servers` rows by **hostname and port**. Map logical p
 
 | Mode | Behaviour |
 |------|-----------|
-| `observe` | Full decision loop; log and metrics only (`mysql_guard_would_act_total`) |
+| `observe` | Full decision loop; log and metrics only (`mysql_guard_would_act_total`). Never writes cluster state (master key, epoch, `writer/current`, `writer/last-gtid`, writer service, MySQL `read_only`); still writes its own bookkeeping (instance heartbeats, actions log, leader lock) |
 | `fence` | Fence stray writers; no promotion |
 | `act` | Fence + promote + ProxySQL admin (when enabled) |
 
@@ -88,7 +88,7 @@ Admin updates match `mysql_servers` rows by **hostname and port**. Map logical p
 
 Both formats are always **read**. A legacy value is mapped to a node through `-mysql-peer-endpoints` (an unknown endpoint is an error, never a guess). Migration (always run with the guards' own flags):
 
-1. Deploy the guards in `-mode=observe` with `-master-format=legacy` next to the bash guard: they read the existing key and write nothing (no key, epoch, writer/current or service).
+1. Deploy the guards in `-mode=observe` with `-master-format=legacy` next to the bash guard: they read the existing key and never write cluster state (master key, epoch, writer/current, writer/last-gtid, writer service, MySQL read_only). They do write their own bookkeeping under `mysql/<cluster>/guard/` and `mysql/<cluster>/actions` (instance heartbeats, actions log, leader lock), so the guard Consul policy needs write there even in observe.
 2. Stop the bash guard, then `mysql-guard migrate-key -to=legacy` once: initialises `writer/epoch` (1) and `writer/current` without changing the key value consumers read.
 3. Switch the guards to `-mode=act`, still legacy. Consumers keep reading `host:port`.
 4. Optional, after every consumer of the key understands `node|epoch`: `migrate-key -to=epoch`, then set `-master-format=epoch`. `migrate-key -to=legacy` reverts. `--dry-run` prints the target value; migration is a CAS on the key and is refused in observe mode.

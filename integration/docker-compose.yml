@@ -1,0 +1,42 @@
+# Local integration stack (placeholders). Not wired to full guard act mode yet.
+services:
+  consul:
+    image: hashicorp/consul:1.19
+    command: agent -dev -client=0.0.0.0 -ui
+    ports:
+      - "8500:8500"
+
+  mysql-primary:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: placeholder
+      MYSQL_ROOT_HOST: "%"
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+    ports:
+      - "33061:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pplaceholder"]
+      interval: 5s
+      retries: 10
+
+  mysql-replica:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: placeholder
+      MYSQL_ROOT_HOST: "%"
+    command:
+      - --server-id=2
+      - --log-bin=mysql-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --read-only=ON
+      - --super-read-only=ON
+    ports:
+      - "33062:3306"
+    depends_on:
+      mysql-primary:
+        condition: service_healthy

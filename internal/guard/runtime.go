@@ -3,6 +3,7 @@ package guard
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -43,6 +44,58 @@ type Runtime struct {
 	lastWatch  time.Time
 	writable   map[string]int
 	deadTicks  int
+	health     HealthReporter
+}
+
+// Version is the build version shown in /status (set from main via ldflags).
+var Version = "dev"
+
+// HealthReporter receives the guard's own health each tick (Consul TTL check).
+type HealthReporter interface {
+	UpdateGuard(status, output string) error
+}
+
+// SetHealthReporter wires the guard's own TTL check. Call before Run.
+func (r *Runtime) SetHealthReporter(h HealthReporter) { r.health = h }
+
+// tickHealth is what one health tick observed about this guard's own duties.
+type tickHealth struct {
+	role        config.Role
+	probe       vote.ProbeResult // local MySQL (db role only)
+	consulErr   error            // writer-key read
+	replUnknown bool
+	replErr     string
+	leader      bool
+	primary     string
+	epoch       uint64
+}
+
+// guardCheckStatus maps a tick to the TTL check status (Consul HealthPassing/Warning/Critical).
+func guardCheckStatus(t tickHealth) (string, string) {
+	if t.consulErr != nil {
+		return "critical", "consul kv unreadable: " + t.consulErr.Error()
+	}
+	if t.role != config.RoleWitness {
+		switch t.probe {
+		case vote.ProbeFailed, vote.ProbeRefused:
+			return "critical", "local mysql unreachable"
+		}
+		if t.replUnknown {
+			return "warning", "replication state unknown: " + t.replErr
+		}
+		if t.probe == vote.ProbeSlow {
+			return "warning", "local mysql slow"
+		}
+	}
+	return "passing", fmt.Sprintf("ok role=%s leader=%t primary=%s epoch=%d", t.role, t.leader, t.primary, t.epoch)
+}
+
+func (r *Runtime) reportHealth(t tickHealth) {
+	if r.health == nil {
+		return
+	}
+	st, out := guardCheckStatus(t)
+	_ = r.health.UpdateGuard(st, out)
 }
 
 func NewRuntime(cfg *config.Config, log *slog.Logger, store *consul.Store, lock *consul.LeaderLock, my *mysql.Prober, peers *mysql.Pool, px *proxysql.Client, exec *actions.Executor, m *metrics.Registry) *Runtime {
@@ -109,8 +162,10 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 	checks := ChecksFor(r.cfg.Role)
 	var ballot vote.Ballot
 	dead := 0
+	th := tickHealth{role: r.cfg.Role}
 	if checks.MySQL {
 		res, elapsed := r.mysql.Ping(ctx)
+		th.probe = res
 		r.metrics.ProbeSeconds.Observe(elapsed.Seconds())
 		switch res {
 		case vote.ProbeSlow:
@@ -126,7 +181,8 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 	}
 
 	maint, maintMsg, _ := r.store.MaintenanceEnabled(ctx)
-	primary, epochKV, _ := r.store.GetPrimary(ctx)
+	primary, epochKV, kvErr := r.store.GetPrimary(ctx)
+	th.consulErr = kvErr
 	if maint != r.lastMaint {
 		r.logMaintenance(ctx, maint, maintMsg, epochKV)
 		r.lastMaint = maint
@@ -143,6 +199,7 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 			replSt.ReadOnly = st.ReadOnly
 			replSt.Unknown = !st.ReplKnown
 			replSt.UnknownErr = st.ReplErr
+			th.replUnknown, th.replErr = !st.ReplKnown, st.ReplErr
 			replSt.IOThreadOn = st.IOThread || !replSt.ExpectReadOnly
 			replSt.SQLThreadOn = st.SQLThread || !replSt.ExpectReadOnly
 			replSt.LagSeconds = st.LagSeconds
@@ -175,6 +232,8 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 	r.metrics.DeadVotes.WithLabelValues("total").Set(float64(dead))
 	r.lastHealth = now
 	r.refreshStatus(ctx, now, dead, maint, maintMsg, primary, epochKV, topology, primaryOK)
+	th.leader, th.primary, th.epoch = r.lock.IsLeader(), primary, epochKV
+	r.reportHealth(th)
 }
 
 func (r *Runtime) buildTopology(ctx context.Context, primary string) ([]NodeTopology, map[string]peerObs) {
@@ -407,6 +466,7 @@ func (r *Runtime) refreshStatus(ctx context.Context, now time.Time, dead int, ma
 
 	r.mu.Lock()
 	r.status.Leader = leader
+	r.status.Version = Version
 	r.status.DeadVotes = dead
 	r.status.Primary = primary
 	r.status.Epoch = epoch

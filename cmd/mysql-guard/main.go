@@ -74,6 +74,7 @@ func runServer(cfg *config.Config) int {
 	mreg := metrics.New()
 	exec := actions.NewExecutor(cfg, log, prober, peerPool, px, store, alerts)
 	rt := guard.NewRuntime(cfg, log, store, lock, prober, peerPool, px, exec, mreg)
+	rt.SetHealthReporter(checks)
 	httpsrv := server.New(rt, store, mreg)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -87,7 +88,7 @@ func runServer(cfg *config.Config) int {
 
 	srv := &http.Server{Addr: cfg.HTTPListen, Handler: httpsrv.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
-		log.Info("mysql-guard listen", "addr", cfg.HTTPListen, "mode", cfg.Mode)
+		log.Info("mysql-guard listen", "addr", cfg.HTTPListen, "mode", cfg.Mode, "version", version)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Error("http", "err", err)
 			cancel()
@@ -106,6 +107,11 @@ func runServer(cfg *config.Config) int {
 	_ = px.Close()
 	return 0
 }
+
+// version is set at build time: -ldflags "-X main.version=vX.Y.Z".
+var version = "dev"
+
+func init() { guard.Version = version }
 
 func isSubcommand(s string) bool {
 	switch s {

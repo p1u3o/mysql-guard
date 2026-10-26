@@ -93,6 +93,7 @@ repl_state_on() { status "$1" | jq -e --arg n "$2" --arg s "$3" '[.nodes[] | sel
 wait_for 30 "db-b reported running on all DB guards" sh -c "$(declare -f status repl_state_on); repl_state_on 9471 db-b running && repl_state_on 9472 db-b running"
 [ "$(status 9471 | jq '[.nodes[] | select(has("proxysql_status"))] | length')" = 0 ] || fail "proxysql_status shown without ProxySQL"
 [ "$(status 9473 | jq '.loops.renew_age_sec < 30')" = true ] || fail "witness renew age $(status 9473 | jq .loops.renew_age_sec)"
+for p in "${GUARDS[@]}"; do [ "$(status $p | jq -r '.version')" = drill ] || fail "guard $p version=$(status $p | jq -r .version)"; done
 pass "drill 1: one leader ($(for p in "${GUARDS[@]}"; do echo -n "$p=$(status $p | jq -r .leader) "; done)), primary=db-a, epoch=$E0"
 
 check_roles() { # <primary> <replica>

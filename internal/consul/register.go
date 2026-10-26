@@ -19,9 +19,10 @@ type AgentChecks struct {
 	checkID   string
 	logger    *slog.Logger
 
-	mu       sync.Mutex
-	disabled bool
-	once     sync.Once
+	ttl ttlUpdater // nil -> client.Agent()
+
+	mu      sync.Mutex
+	failing bool
 }
 
 func NewAgentChecks(client *capi.Client, serviceID string, log *slog.Logger) *AgentChecks {
@@ -74,29 +75,54 @@ func parseListenPort(addr string) int {
 	return p
 }
 
-func (a *AgentChecks) SetCheckStatus(ctx context.Context, _ string, status, output string) error {
-	if a.serviceID == "" || a.disabled {
-		return nil
-	}
-	err := a.client.Agent().UpdateTTL(a.checkID, output, status)
-	if err == nil {
-		return nil
-	}
-	a.once.Do(func() {
-		if a.logger != nil {
-			a.logger.Warn("consul TTL updates disabled; register service or fix agent", "service_id", a.serviceID, "err", err)
-		}
-	})
-	a.mu.Lock()
-	a.disabled = true
-	a.mu.Unlock()
-	return err
+// ttlUpdater is the subset of the Consul agent API used for TTL updates (fake in tests).
+type ttlUpdater interface {
+	UpdateTTL(checkID, output, status string) error
 }
 
-// PassTTL marks the guard check healthy (call periodically from leader).
-func (a *AgentChecks) PassTTL(output string) {
-	_ = a.SetCheckStatus(context.Background(), "guard", "pass", output)
+func (a *AgentChecks) updater() ttlUpdater {
+	if a.ttl != nil {
+		return a.ttl
+	}
+	return a.client.Agent()
 }
+
+// SetCheckStatus is the alert sink used by notify.Fanout. Alerts are logged and
+// sent to ntfy; they must not overwrite the guard's own liveness TTL check, so
+// this is a no-op (the guard check reflects the guard tick via UpdateGuard).
+func (a *AgentChecks) SetCheckStatus(ctx context.Context, _ string, status, output string) error {
+	return nil
+}
+
+// UpdateGuard sets the guard's own TTL check (<service_id>:guard). status is
+// capi.HealthPassing, HealthWarning or HealthCritical. Errors are logged once per
+// failure streak and retried on the next tick (never permanently disabled).
+func (a *AgentChecks) UpdateGuard(status, output string) error {
+	if a.serviceID == "" {
+		return nil
+	}
+	if len(output) > 4096 {
+		output = output[:4096]
+	}
+	err := a.updater().UpdateTTL(a.checkID, output, status)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err != nil {
+		if !a.failing && a.logger != nil {
+			a.logger.Warn("consul TTL update failed; retrying each tick", "check_id", a.checkID, "err", err)
+		}
+		a.failing = true
+		return err
+	}
+	if a.failing && a.logger != nil {
+		a.logger.Info("consul TTL update recovered", "check_id", a.checkID)
+	}
+	a.failing = false
+	return nil
+}
+
+// PassTTL marks the guard check healthy.
+func (a *AgentChecks) PassTTL(output string) { _ = a.UpdateGuard(capi.HealthPassing, output) }
 
 // AlertCheckID returns the check id used for replication alerts.
 func (a *AgentChecks) AlertCheckID(code string) string {

@@ -49,6 +49,7 @@ type Status struct {
 	Node           string                   `json:"node"`
 	Role           string                   `json:"role"`
 	Mode           string                   `json:"mode"`
+	Version        string                   `json:"version"`
 	Leader         bool                     `json:"leader"`
 	DeadVotes      int                      `json:"dead_votes"`
 	LastDecision   string                   `json:"last_decision"`

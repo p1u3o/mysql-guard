@@ -183,3 +183,20 @@ func (e *Executor) LogBlocked(ctx context.Context, epoch uint64, action, reason,
 	e.actionLog(ctx, epoch, action, reason, "blocked", step)
 	e.log.Warn(action+" blocked", "step", step, "reason", reason)
 }
+
+// Alert sends an alert through the configured fan-out (no-op without one).
+func (e *Executor) Alert(ctx context.Context, code, msg string, critical bool) {
+	e.log.Warn("alert", "code", code, "msg", msg)
+	if e.alerts != nil {
+		if err := e.alerts.Alert(ctx, code, msg, critical); err != nil {
+			e.log.Warn("alert delivery failed", "code", code, "err", err)
+		} else {
+			e.log.Info("alert sent", "code", code)
+		}
+	}
+}
+
+// LogAction appends an action-log entry with an explicit result.
+func (e *Executor) LogAction(ctx context.Context, epoch uint64, action, reason, result, step string) {
+	e.actionLog(ctx, epoch, action, reason, result, step)
+}

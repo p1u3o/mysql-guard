@@ -52,6 +52,13 @@ type Runtime struct {
 	stalled    map[string]string // node -> reason, this tick
 	lastWriter consul.WriterGTID // last-known writer executed set
 	lwDirty    bool              // lastWriter not yet published to Consul (retry until a leader write succeeds)
+
+	// v0.3.0
+	foreignTicks int
+	foreignAlert string
+	pxSince      time.Time
+	pxAlerted    string
+	svcLastErr   string
 }
 
 // Version is the build version shown in /status (set from main via ldflags).
@@ -235,7 +242,11 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 				o := obs[p]
 				in.Nodes = append(in.Nodes, SeedNode{Node: p, Reachable: o.err == nil, Writable: o.err == nil && !o.st.ReadOnly, Executed: gtid.Parse(o.st.Executed)})
 			}
-			if node, err := maybeSeedMaster(ctx, r.log, r.store, r.cfg.NodeName, in, r.cfg.ActionLogMax); err != nil {
+			if r.cfg.Mode == config.ModeObserve {
+				if n, why, ok := ShouldSeedMaster(in); ok {
+					r.setDecision("observe: would seed writer key " + n + " (" + why + ")")
+				}
+			} else if node, err := maybeSeedMaster(ctx, r.log, r.store, r.cfg.NodeName, in, r.cfg.ActionLogMax); err != nil {
 				r.log.Warn("seed writer key", "err", err)
 			} else if node != "" {
 				primary, epochKV, _ = r.store.GetPrimary(ctx)
@@ -244,6 +255,9 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 		} else {
 			dead = r.decide(ctx, now, maint, primary, epochKV, obs)
 		}
+	}
+	if checks.MySQL && r.lock.IsLeader() {
+		r.v030Checks(ctx, now, maint, primary, epochKV)
 	}
 	r.metrics.DeadVotes.WithLabelValues("total").Set(float64(dead))
 	r.lastHealth = now

@@ -3,8 +3,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 ARG VERSION=drill
+ARG TAGS=
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /mysql-guard ./cmd/mysql-guard
+RUN CGO_ENABLED=0 go build -trimpath -tags "${TAGS}" -ldflags="-s -w -X main.version=${VERSION}" -o /mysql-guard ./cmd/mysql-guard
 RUN CGO_ENABLED=0 go build -trimpath -o /slowproxy ./integration/slowproxy
 
 FROM debian:bookworm-slim

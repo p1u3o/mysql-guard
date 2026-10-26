@@ -100,6 +100,16 @@ type Config struct {
 	MySQLCAFile           string
 
 	Promotable bool
+
+	// v0.3.0
+	MasterFormat        string // epoch | legacy
+	WriterServiceName   string // Consul catalog service pointing at the writer ("" = off)
+	WriterServiceTags   []string
+	ProxySQLVerify      bool          // read-only check of the ProxySQL writer hostgroup via admin
+	ProxySQLVerifyGrace time.Duration // mismatch must persist this long before alerting
+	ForeignWriteAlert   bool          // alert when the master key was written by something other than a guard
+	NtfyTokenFile       string
+	NtfyToken           string
 }
 
 // ProxySQLConfig is passed to the ProxySQL client.
@@ -107,6 +117,7 @@ func (c *Config) ProxySQLConfig() ProxySQLSettings {
 	admin := c.ProxySQLAdminEnable || c.ProxySQLMode == ProxySQLAdmin
 	return ProxySQLSettings{
 		AdminEnabled:    admin,
+		Verify:          c.ProxySQLVerify,
 		AdminDSN:        c.ProxySQLAdminDSN,
 		WriterHostgroup: c.ProxySQLWriterHG,
 		ReaderHostgroup: c.ProxySQLReaderHG,
@@ -117,6 +128,7 @@ func (c *Config) ProxySQLConfig() ProxySQLSettings {
 // ProxySQLSettings for the proxysql package.
 type ProxySQLSettings struct {
 	AdminEnabled    bool
+	Verify          bool
 	AdminDSN        string
 	WriterHostgroup int
 	ReaderHostgroup int
@@ -158,6 +170,7 @@ func Load(args []string) (*Config, error) {
 	}
 
 	var peers string
+	var writerTags string
 	var proxysqlPeers string
 	var mysqlPeers string
 	fs.StringVar(&c.NodeName, "node", envOr("GUARD_NODE", ""), "this node's logical name")
@@ -206,11 +219,30 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.MySQLCAFile, "mysql-ca-file", envOr("MYSQL_CA_FILE", ""), "CA PEM for peer MySQL TLS")
 	fs.IntVar(&c.ActionLogMax, "action-log-max", c.ActionLogMax, "max entries in Consul action log KV")
 
+	fs.StringVar(&c.MasterFormat, "master-format", envOr("MASTER_FORMAT", "epoch"), "mysql/master/<cluster> write format: epoch (node|epoch) or legacy (host:port, epoch in writer/epoch); reads accept both")
+	fs.StringVar(&c.WriterServiceName, "writer-service", envOr("WRITER_SERVICE", ""), "Consul catalog service kept pointing at the writer (e.g. <cluster>-writer); empty = off")
+	fs.StringVar(&writerTags, "writer-service-tags", envOr("WRITER_SERVICE_TAGS", "mysql,writer"), "comma-separated tags for -writer-service")
+	fs.BoolVar(&c.ProxySQLVerify, "proxysql-verify", envBool("PROXYSQL_VERIFY", false), "read-only: compare ProxySQL runtime writer hostgroup with the writer key via -proxysql-admin-dsn and alert on mismatch (no ProxySQL writes)")
+	fs.DurationVar(&c.ProxySQLVerifyGrace, "proxysql-verify-grace", envDuration("PROXYSQL_VERIFY_GRACE", 20*time.Second), "mismatch must persist this long before the alert")
+	fs.BoolVar(&c.ForeignWriteAlert, "foreign-write-alert", envBool("FOREIGN_WRITE_ALERT", true), "alert when the master key was changed by something other than a guard (repman/bash post-script)")
+	fs.StringVar(&c.NtfyTokenFile, "ntfy-token-file", envOr("NTFY_TOKEN_FILE", ""), "optional ntfy access token file (Authorization: Bearer)")
+
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
 
 	c.Peers = splitCSV(peers)
+	c.WriterServiceTags = splitCSV(writerTags)
+	if c.MasterFormat != "epoch" && c.MasterFormat != "legacy" {
+		return nil, fmt.Errorf("-master-format must be epoch or legacy")
+	}
+	if c.NtfyTokenFile != "" {
+		b, err := os.ReadFile(c.NtfyTokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("read ntfy token file: %w", err)
+		}
+		c.NtfyToken = strings.TrimSpace(string(b))
+	}
 	c.ProxySQLPeerEndpoints = parsePeerEndpoints(proxysqlPeers)
 	c.MySQLPeerEndpoints = parsePeerEndpoints(mysqlPeers)
 	if len(c.MySQLPeerEndpoints) == 0 && mysqlPeers == "" {

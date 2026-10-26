@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"sync"
 	"time"
 
 	capi "github.com/hashicorp/consul/api"
@@ -24,6 +24,12 @@ type GTIDRecord struct {
 type Store struct {
 	client *capi.Client
 	keys   KeyPaths
+	opts   Options
+
+	mu      sync.Mutex
+	seenIdx uint64 // master key ModifyIndex last observed
+	ownIdx  uint64 // master key ModifyIndex of our last write
+	foreign string // set when the master key changed but not by this guard
 }
 
 func NewStore(addr, token string, cluster string) (*Store, error) {
@@ -36,7 +42,7 @@ func NewStore(addr, token string, cluster string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{client: client, keys: KeyPaths{Cluster: cluster}}, nil
+	return &Store{client: client, keys: KeyPaths{Cluster: cluster}, opts: Options{Format: FormatEpoch}}, nil
 }
 
 func (s *Store) Client() *capi.Client { return s.client }
@@ -99,12 +105,6 @@ func (s *Store) CasBumpEpoch(ctx context.Context, expect uint64) (uint64, error)
 	return next, nil
 }
 
-func (s *Store) SetMaster(ctx context.Context, node string, epoch uint64) error {
-	val := fmt.Sprintf("%s|%d", node, epoch)
-	_, err := s.client.KV().Put(&capi.KVPair{Key: s.keys.MasterKV(), Value: []byte(val)}, nil)
-	return err
-}
-
 func (s *Store) MarkFenced(ctx context.Context, node string, epoch uint64) error {
 	val := fmt.Sprintf("%d", epoch)
 	_, err := s.client.KV().Put(&capi.KVPair{Key: s.keys.Fenced(node), Value: []byte(val)}, nil)
@@ -136,21 +136,6 @@ type GuardPresence struct {
 func (s *Store) ListGuardPresence(ctx context.Context) ([]GuardPresence, error) {
 	// TODO: discover via Consul health API for service mysql-guard
 	return nil, nil
-}
-
-// GetPrimary returns current primary node from master KV.
-func (s *Store) GetPrimary(ctx context.Context) (string, uint64, error) {
-	pair, _, err := s.client.KV().Get(s.keys.MasterKV(), nil)
-	if err != nil || pair == nil || len(pair.Value) == 0 {
-		return "", 0, err
-	}
-	val := string(pair.Value)
-	node, epochStr, _ := strings.Cut(val, "|")
-	var epoch uint64
-	if epochStr != "" {
-		_, _ = fmt.Sscanf(epochStr, "%d", &epoch)
-	}
-	return node, epoch, nil
 }
 
 // WriterGTID is the last-known writer's executed set (promotion superset guard).

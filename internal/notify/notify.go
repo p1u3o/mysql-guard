@@ -17,6 +17,7 @@ type Sender interface {
 // Ntfy posts to an ntfy topic URL (placeholder in repo).
 type Ntfy struct {
 	URL    string
+	Token  string // optional bearer token
 	Client *http.Client
 }
 
@@ -34,6 +35,9 @@ func (n *Ntfy) Send(ctx context.Context, title, message string, priority int) er
 		return err
 	}
 	req.Header.Set("Title", title)
+	if n.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+n.Token)
+	}
 	if priority > 0 {
 		req.Header.Set("Priority", fmt.Sprintf("%d", priority))
 	}
@@ -67,9 +71,10 @@ type ConsulCheckUpdater interface {
 
 // Fanout sends to ntfy and Consul checks.
 type Fanout struct {
-	Ntfy   Sender
-	Consul ConsulCheckUpdater
-	Prefix string
+	Ntfy    Sender
+	Consul  ConsulCheckUpdater
+	Prefix  string
+	Cluster string // shown in the ntfy title when set
 }
 
 func (f *Fanout) Alert(ctx context.Context, code, message string, critical bool) error {
@@ -77,8 +82,13 @@ func (f *Fanout) Alert(ctx context.Context, code, message string, critical bool)
 	if critical {
 		pri = 5
 	}
+	title := "mysql-guard: " + code
+	if f.Cluster != "" {
+		title = "mysql-guard " + f.Cluster + ": " + code
+	}
+	var sendErr error
 	if f.Ntfy != nil {
-		_ = f.Ntfy.Send(ctx, "mysql-guard: "+code, message, pri)
+		sendErr = f.Ntfy.Send(ctx, title, message, pri)
 	}
 	if f.Consul != nil {
 		st := "warning"
@@ -87,7 +97,7 @@ func (f *Fanout) Alert(ctx context.Context, code, message string, critical bool)
 		}
 		_ = f.Consul.SetCheckStatus(ctx, f.Prefix+code, st, message)
 	}
-	return nil
+	return sendErr
 }
 
 // JSON for testing payloads.

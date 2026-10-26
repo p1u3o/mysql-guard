@@ -1,0 +1,109 @@
+# v0.3.0 drills: legacy key + writer service + ProxySQL verify + ntfy.
+# Use with: docker compose -f docker-compose.yml -f docker-compose.v030.yml
+services:
+  ntfy:
+    image: binwiederhier/ntfy:v2.11.0
+    command: serve
+    ports:
+      - "18093:80"
+  proxysql:
+    image: proxysql/proxysql:2.7.1
+    volumes:
+      - ./proxysql-v030.cnf:/etc/proxysql.cnf:ro
+    ports:
+      - "16033:6033"
+  guard-a:
+    build:
+      args:
+        TAGS: faultinject
+    environment:
+      CONSUL_HTTP_ADDR: consul:8500
+      MYSQL_PASSWORD: placeholder
+      MYSQL_REPL_USER: repl
+      MYSQL_REPL_PASSWORD: placeholder
+      REPL_CONNECT_TIMEOUT: 15s
+      GUARD_MODE: ${GMODE:-observe}
+      PROXYSQL_ADMIN_DSN: "radmin:placeholder@tcp(proxysql:6032)/"
+    command:
+      - --node=db-a
+      - --mysql-host=db-a
+      - --role=db
+      - --cluster=example
+      - --peers=db-a,db-b
+      - --mysql-user=root
+      - --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --master-format=legacy
+      - --writer-service=example-writer
+      - --ntfy-url=http://ntfy/mg-drill
+      - --proxysql-verify
+      - --proxysql-verify-grace=15s
+      - --proxysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --interval=2s
+      - --stall-after=10s
+      - --min-between-failovers=20s
+      - --session-ttl=10s
+      - --lock-delay=1s
+      - --http=:9471
+  guard-b:
+    build:
+      args:
+        TAGS: faultinject
+    environment:
+      CONSUL_HTTP_ADDR: consul:8500
+      MYSQL_PASSWORD: placeholder
+      MYSQL_REPL_USER: repl
+      MYSQL_REPL_PASSWORD: placeholder
+      REPL_CONNECT_TIMEOUT: 15s
+      GUARD_MODE: ${GMODE:-observe}
+      PROXYSQL_ADMIN_DSN: "radmin:placeholder@tcp(proxysql:6032)/"
+    command:
+      - --node=db-b
+      - --mysql-host=db-b
+      - --role=db
+      - --cluster=example
+      - --peers=db-a,db-b
+      - --mysql-user=root
+      - --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --master-format=legacy
+      - --writer-service=example-writer
+      - --ntfy-url=http://ntfy/mg-drill
+      - --proxysql-verify
+      - --proxysql-verify-grace=15s
+      - --proxysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --interval=2s
+      - --stall-after=10s
+      - --min-between-failovers=20s
+      - --session-ttl=10s
+      - --lock-delay=1s
+      - --http=:9472
+  guard-witness:
+    build:
+      args:
+        TAGS: faultinject
+    environment:
+      CONSUL_HTTP_ADDR: consul:8500
+      MYSQL_PASSWORD: placeholder
+      MYSQL_REPL_USER: repl
+      MYSQL_REPL_PASSWORD: placeholder
+      REPL_CONNECT_TIMEOUT: 15s
+      GUARD_MODE: ${GMODE:-observe}
+      PROXYSQL_ADMIN_DSN: "radmin:placeholder@tcp(proxysql:6032)/"
+    command:
+      - --node=witness-1
+      - --role=witness
+      - --cluster=example
+      - --peers=db-a,db-b
+      - --mysql-user=root
+      - --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --master-format=legacy
+      - --writer-service=example-writer
+      - --ntfy-url=http://ntfy/mg-drill
+      - --proxysql-verify
+      - --proxysql-verify-grace=15s
+      - --proxysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --interval=2s
+      - --stall-after=10s
+      - --min-between-failovers=20s
+      - --session-ttl=10s
+      - --lock-delay=1s
+      - --http=:9473

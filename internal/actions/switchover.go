@@ -30,7 +30,7 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 	e.actionLog(ctx, 0, "switchover", "starting", "ok", "begin")
 	if e.observe {
 		e.actionLog(ctx, 0, "switchover", "observe mode", "skipped", "end")
-		return nil
+		return fmt.Errorf("switchover refused: guard is in observe mode (writes nothing)")
 	}
 	if e.peers == nil {
 		return fmt.Errorf("peer pool not configured")
@@ -93,10 +93,32 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 	newEpoch, err := e.store.CasBumpEpoch(ctx, epoch)
 	if err != nil {
 		e.actionLog(ctx, epoch, "switchover", err.Error(), "error", "epoch_bump")
+		// v0.3.0: never leave the new node writable behind a key that still
+		// names the old one. Demote it and roll back if it took no writes.
+		if rerr := e.undoPromote(ctx, oldAdm, newAdm, oldPrimary, newPrimary); rerr != nil {
+			return fmt.Errorf("epoch bump failed (%v); %v", err, rerr)
+		}
+		rollback()
 		return err
 	}
-	if err := e.store.SetMaster(ctx, newPrimary, newEpoch); err != nil {
-		return e.abortSwitchoverPostEpoch(ctx, newEpoch, oldPrimary, newPrimary, err.Error())
+	if err := e.setMasterRetry(ctx, newPrimary, newEpoch); err != nil {
+		if cur, _, gerr := e.store.GetPrimary(ctx); gerr == nil && cur == newPrimary {
+			// key written; only the writer service sync failed: keep going, the
+			// leader's per-tick sync retries it.
+			e.actionLog(ctx, newEpoch, "switchover", err.Error(), "warn", "writer_service")
+		} else {
+			e.actionLog(ctx, newEpoch, "switchover", err.Error(), "error", "set_master")
+			if rerr := e.undoPromote(ctx, oldAdm, newAdm, oldPrimary, newPrimary); rerr != nil {
+				return e.abortSwitchoverPostEpoch(ctx, newEpoch, oldPrimary, newPrimary, err.Error()+"; "+rerr.Error())
+			}
+			// key still names old (now read-only with every GTID): restore it
+			// writable at a fresh epoch, exactly like the guard's restore_writer.
+			_ = oldAdm.SetSuperReadOnly(ctx, false)
+			_ = e.proxy.ApplyPromote(ctx, oldPrimary, newPrimary)
+			e.actionLog(ctx, newEpoch, "switchover", "set_master failed after epoch bump; new demoted, old restored writable (key unchanged)", "abort", "post_epoch_rollback")
+			e.Alert(ctx, "switchover-aborted", fmt.Sprintf("switchover %s -> %s aborted after epoch bump (%s); %s kept as writer", oldPrimary, newPrimary, err, oldPrimary), true)
+			return fmt.Errorf("switchover aborted: %s", err)
+		}
 	}
 	if err := e.proxy.ApplyPromote(ctx, newPrimary, oldPrimary); err != nil {
 		e.actionLog(ctx, newEpoch, "switchover", err.Error(), "warn", "proxysql_online_new")
@@ -106,6 +128,14 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 	// needs-rebuild only if, after reconnecting, the actual source config is wrong.
 	recovered, err := oldAdm.ChangeSourceVerified(ctx, srcHost, srcPort, replUser, replPass)
 	if err != nil {
+		// v0.3.0: the old primary was read-only with GTIDs ⊆ new's; a failed
+		// re-point is a connectivity problem, not lost data. Only mark
+		// needs-rebuild when the old node really has transactions the new lacks.
+		oldSet, oerr := oldAdm.GTIDExecuted(ctx)
+		newSet, nerr := newAdm.GTIDExecuted(ctx)
+		if oerr == nil && nerr == nil && gtid.Subtract(oldSet, newSet).Empty() {
+			return e.degraded(ctx, newEpoch, "switchover", fmt.Sprintf("%s -> %s promoted at epoch %d; re-pointing %s failed (%s), its data is a subset of the new primary: rejoin retries, no rebuild needed", oldPrimary, newPrimary, newEpoch, oldPrimary, err))
+		}
 		return e.abortSwitchoverPostEpoch(ctx, newEpoch, oldPrimary, newPrimary, err.Error())
 	}
 	if recovered {
@@ -123,6 +153,50 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 		return e.degraded(ctx, newEpoch, "switchover", fmt.Sprintf("%s -> %s promoted at epoch %d but replica %s not connected (user %s): %s", oldPrimary, newPrimary, newEpoch, oldPrimary, replUser, err))
 	}
 	e.actionLog(ctx, newEpoch, "switchover", fmt.Sprintf("%s -> %s complete at epoch %d, replica %s connected (user %s)", oldPrimary, newPrimary, newEpoch, oldPrimary, replUser), "ok", "end")
+	e.Alert(ctx, "switchover", fmt.Sprintf("%s -> %s complete at epoch %d", oldPrimary, newPrimary, newEpoch), false)
+	return nil
+}
+
+func (e *Executor) setMasterRetry(ctx context.Context, node string, epoch uint64) error {
+	var err error
+	for i := 0; i < 3; i++ {
+		if err = e.store.SetMaster(ctx, node, epoch); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(i+1) * 500 * time.Millisecond):
+		}
+	}
+	return err
+}
+
+// undoPromote makes the new node read-only again; it refuses (keeps new
+// writable) if new already holds transactions the old primary lacks.
+func (e *Executor) undoPromote(ctx context.Context, oldAdm, newAdm *mysql.Admin, oldPrimary, newPrimary string) error {
+	if err := newAdm.SetSuperReadOnly(ctx, true); err != nil {
+		return fmt.Errorf("could not demote %s: %w", newPrimary, err)
+	}
+	oldSet, oerr := oldAdm.GTIDExecuted(ctx)
+	newSet, nerr := newAdm.GTIDExecuted(ctx)
+	if oerr != nil || nerr != nil {
+		return fmt.Errorf("could not compare GTIDs (%v/%v)", oerr, nerr)
+	}
+	if extra := gtid.Subtract(newSet, oldSet); !extra.Empty() {
+		_ = newAdm.SetSuperReadOnly(ctx, false)
+		return fmt.Errorf("%s took writes during the switchover (%s); kept writable", newPrimary, extra)
+	}
+	// re-point the demoted node at the old primary again (best effort; the
+	// guard's rejoin handles it otherwise).
+	if h, p, err := mysql.PeerHostPort(e.cfg, oldPrimary); err == nil {
+		u, pw := e.cfg.ReplCredentials()
+		if _, err := newAdm.ChangeSourceVerified(ctx, h, p, u, pw); err == nil {
+			_, _, _ = newAdm.StartReplicaRetry(ctx, 5, 500*time.Millisecond)
+		} else {
+			e.log.Warn("re-point demoted node", "node", newPrimary, "err", err)
+		}
+	}
 	return nil
 }
 

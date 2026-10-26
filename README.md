@@ -40,9 +40,9 @@ Open `http://<listen>/` on the same `-http` address. The dashboard polls `/statu
 
 `-mysql-peer-endpoints` / `MYSQL_PEER_ENDPOINTS` (`db-a=host:port,db-b=host:port`) with shared `-mysql-user` and password file. Optional `-mysql-tls` and `-mysql-ca-file`. Switchover/rejoin and `/status` cluster view use these connections (local DSN remains fallback for this node).
 
-### Switchover rollback after epoch bump
+### Switchover rollback after epoch bump (v0.3.0)
 
-Before the epoch CAS and master KV update, failed steps roll back (old primary writable, ProxySQL restored). **After epoch bump**, failures do not demote the new primary: the guard runs a **post-epoch abort** — logs `switchover_abort`, sets `mysql/<cluster>/guard/needs-rebuild/<old>`, and alerts. Manual rebuild of the old node is required.
+Before the epoch CAS and master KV update, failed steps roll back (old primary writable, ProxySQL restored). If writing the master key fails **after** the epoch bump (3 attempts), the guard now aborts cleanly instead of leaving a half-done switchover: the new node is demoted (refused if it already has transactions the old primary lacks), re-pointed at the old primary, the old primary is made writable again and re-published at the bumped epoch, and `switchover-aborted` is alerted. If only the writer-service sync failed after the key was written, the switchover completes and the next leader tick retries the service. Drilled with a `-tags faultinject` build (`integration/scripts/v030-drill.sh` V4); release builds contain no fault hook.
 
 ### ProxySQL admin
 
@@ -76,6 +76,47 @@ Admin updates match `mysql_servers` rows by **hostname and port**. Map logical p
 | `--min-between-failovers` | `1h` | Rate limit between real failovers (writer moves to another node) |
 | `--read-only-grace` | `10s` | A reachable primary that stays read-only this long counts as failed (see below) |
 | Maintenance KV | | `mysql/<cluster>/guard/maintenance` — any value pauses actions |
+
+## v0.3.0: prod-compatibility features
+
+### Master key format and migration
+
+`-master-format` / `MASTER_FORMAT`:
+
+* `epoch` (default): `mysql/master/<cluster>` = `node|epoch`.
+* `legacy`: `mysql/master/<cluster>` = `host:port` exactly as the bash guard and the repman post-script write it; the epoch is kept in `mysql/<cluster>/writer/epoch` and `mysql/<cluster>/writer/current` = `node|epoch`.
+
+Both formats are always **read**. A legacy value is mapped to a node through `-mysql-peer-endpoints` (an unknown endpoint is an error, never a guess). Migration (always run with the guards' own flags):
+
+1. Deploy the guards in `-mode=observe` with `-master-format=legacy` next to the bash guard: they read the existing key and write nothing (no key, epoch, writer/current or service).
+2. Stop the bash guard, then `mysql-guard migrate-key -to=legacy` once: initialises `writer/epoch` (1) and `writer/current` without changing the key value consumers read.
+3. Switch the guards to `-mode=act`, still legacy. Consumers keep reading `host:port`.
+4. Optional, after every consumer of the key understands `node|epoch`: `migrate-key -to=epoch`, then set `-master-format=epoch`. `migrate-key -to=legacy` reverts. `--dry-run` prints the target value; migration is a CAS on the key and is refused in observe mode.
+
+### Writer service
+
+`-writer-service=<name>` (e.g. `mysql-prod-writer`), `-writer-service-tags` (default `mysql,writer`). The leader registers a catalog service on node `<name>-vnode` pointing at the primary's endpoint, with Meta `cluster`, `node`, `epoch`, `promoted_by=mysql-guard` — the same shape as the bash guard's `mysql-prod-writer`. Synced after every SetMaster and every leader tick (idempotent); never in observe mode or under maintenance. Failure alerts `writer_service_sync_failed`. The guard's Consul policy needs `service "<name>" { policy = "write" }` and `node "<name>-vnode" { policy = "write" }`.
+
+### Repman: the guard is the sole promoter
+
+Run replication-manager in `failover-mode = "manual"` and replace its `failover-post-script` (`repman-failover-consul.sh`) with a no-op (`examples/repman-failover-post-script-noop.sh`), so only the guard writes `mysql/master/<cluster>` and the writer service. Repman stays useful for monitoring. Any write to the master key that the guard did not make (wrong epoch/node vs `writer/epoch` / `writer/current`, or a legacy value while in epoch mode) is alerted as `foreign_master_write` after 2 ticks (`-foreign-write-alert`, default on), and `foreign_master_write_cleared` once consistent.
+
+### ProxySQL verification
+
+Default unchanged: ProxySQL follows `read_only` (`mysql_replication_hostgroups`) and the guard never writes ProxySQL. `-proxysql-verify` with `-proxysql-admin-dsn` (the guard only runs `SELECT`s; ProxySQL has no read-only admin role, so give it a dedicated admin user) compares `runtime_mysql_servers` ONLINE rows in the writer hostgroup (`-proxysql-writer-hg`, 10) with the primary's `-proxysql-peer-endpoints` entry. A mismatch persisting `-proxysql-verify-grace` (20s) alerts `proxysql_writer_mismatch`, then `proxysql_writer_ok` when fixed. It only alerts; it never changes ProxySQL or the primary.
+
+### ntfy alerts
+
+`-ntfy-url` (`https://ntfy.sh/<topic>` or a self-hosted server), optional `-ntfy-token-file` (Bearer). Title `mysql-guard <cluster>: <code>`. Codes: `switchover`, `switchover-aborted`, `failover`, `restore_writer`, `fence`, `needs-rebuild`, `errant_gtid`, `*-degraded`, `foreign_master_write[_cleared]`, `proxysql_writer_mismatch` / `proxysql_writer_ok`, `writer_service_sync_failed`. Delivery failures are logged (`alert delivery failed`).
+
+### Remaining before production
+
+* Prod Consul policies: add the writer service/vnode write rules and `writer/` keys for the prod guard tokens.
+* Repman: switch the prod post-script to the no-op and confirm `failover-mode=manual` (needs Daniel).
+* ntfy: dedicated prod topic in prod Vault (exists for the bash guard) and a subscribed device; consider a token-protected self-hosted topic.
+* Shadow run: guards in observe + legacy beside the bash guard for an agreed period, comparing decisions, then the cut-over (stop bash guard, `migrate-key -to=legacy`, act).
+* Prod ProxySQL: a dedicated admin user (remote-capable, not `admin`) for `-proxysql-verify`.
+* Runbook for `switchover-aborted`, `foreign_master_write`, `needs-rebuild`.
 
 ## Read-only primary (v0.2.8)
 

@@ -16,7 +16,6 @@ import (
 	"mysql-guard/internal/guard"
 	"mysql-guard/internal/metrics"
 	"mysql-guard/internal/mysql"
-	"mysql-guard/internal/notify"
 	"mysql-guard/internal/proxysql"
 	"mysql-guard/internal/server"
 )
@@ -26,6 +25,9 @@ func main() {
 }
 
 func run(args []string) int {
+	if len(args) > 0 && args[0] == "migrate-key" {
+		return runMigrateKey(args[1:])
+	}
 	if len(args) > 0 && isSubcommand(args[0]) {
 		return runCLI(args)
 	}
@@ -46,6 +48,8 @@ func runServer(cfg *config.Config) int {
 		log.Error("consul", "err", err)
 		return 1
 	}
+	store.SetOptions(storeOptions(cfg))
+	log.Info("master key adapter", "format", cfg.MasterFormat, "writer_service", cfg.WriterServiceName, "proxysql_verify", cfg.ProxySQLVerify)
 	if cfg.ConsulServiceID != "" {
 		if err := consul.RegisterAgentService(context.Background(), store.Client(), cfg.ConsulServiceName, cfg.ConsulServiceID, cfg.HTTPListen); err != nil {
 			log.Warn("consul service register", "err", err)
@@ -70,7 +74,7 @@ func runServer(cfg *config.Config) int {
 		return 1
 	}
 	checks := consul.NewAgentChecks(store.Client(), cfg.ConsulServiceID, log)
-	alerts := &notify.Fanout{Ntfy: notify.NewNtfy(cfg.NtfyURL), Consul: checks, Prefix: "guard-"}
+	alerts := newAlerts(cfg, checks)
 	mreg := metrics.New()
 	exec := actions.NewExecutor(cfg, log, prober, peerPool, px, store, alerts)
 	rt := guard.NewRuntime(cfg, log, store, lock, prober, peerPool, px, exec, mreg)
@@ -135,10 +139,11 @@ func runCLI(args []string) int {
 		log.Error("consul", "err", err)
 		return 1
 	}
+	store.SetOptions(storeOptions(cfg))
 	prober, _ := mysql.NewProber(cfg.MySQLDSN, mysql.ProbeConfig{Timeout: cfg.ProbeTimeout})
 	peerPool, _ := mysql.NewPool(cfg)
 	px, _ := proxysql.NewClient(cfg.ProxySQLConfig())
-	exec := actions.NewExecutor(cfg, log, prober, peerPool, px, store, nil)
+	exec := actions.NewExecutor(cfg, log, prober, peerPool, px, store, newAlerts(cfg, nil))
 	ctx := context.Background()
 	readExecuted := func(peer string) gtid.Set {
 		if peerPool != nil {

@@ -26,6 +26,7 @@ type AdminAction struct {
 // Client updates ProxySQL when admin mode is enabled.
 type Client struct {
 	enabled   bool
+	verify    bool
 	writerHG  int
 	readerHG  int
 	endpoints map[string]string
@@ -35,11 +36,12 @@ type Client struct {
 func NewClient(cfg config.ProxySQLSettings) (*Client, error) {
 	c := &Client{
 		enabled:   cfg.AdminEnabled,
+		verify:    cfg.Verify,
 		writerHG:  cfg.WriterHostgroup,
 		readerHG:  cfg.ReaderHostgroup,
 		endpoints: cfg.PeerEndpoints,
 	}
-	if !cfg.AdminEnabled || cfg.AdminDSN == "" {
+	if (!cfg.AdminEnabled && !cfg.Verify) || cfg.AdminDSN == "" {
 		return c, nil
 	}
 	db, err := sql.Open("mysql", cfg.AdminDSN)
@@ -127,4 +129,54 @@ func (c *Client) ApplyFence(ctx context.Context, peer string) error {
 		}
 	}
 	return nil
+}
+
+// VerifyEnabled reports whether the read-only writer-hostgroup check can run.
+func (c *Client) VerifyEnabled() bool { return c.verify && c.db != nil }
+
+// WriterHostgroup returns the ONLINE host:port rows of the writer hostgroup in
+// ProxySQL's runtime config (read-only query, no admin writes).
+func (c *Client) WriterHostgroup(ctx context.Context) ([]string, error) {
+	if c.db == nil {
+		return nil, errors.New("proxysql admin DSN not configured")
+	}
+	rows, err := c.db.QueryContext(ctx, fmt.Sprintf("SELECT hostname, port FROM runtime_mysql_servers WHERE hostgroup_id=%d AND status='ONLINE'", c.writerHG))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var h string
+		var p int
+		if err := rows.Scan(&h, &p); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s:%d", h, p))
+	}
+	return out, rows.Err()
+}
+
+// WriterMismatch compares the ProxySQL writer hostgroup with the expected
+// writer endpoint. "" means consistent (exactly the writer, nothing else).
+func WriterMismatch(online []string, want string) string {
+	if want == "" {
+		return ""
+	}
+	if len(online) == 1 && online[0] == want {
+		return ""
+	}
+	return fmt.Sprintf("ProxySQL writer hostgroup ONLINE=%v, writer key says %s", online, want)
+}
+
+// ExpectedEndpoint is the host:port ProxySQL should have for peer.
+func (c *Client) ExpectedEndpoint(peer string) string {
+	if c.endpoints[peer] == "" {
+		return ""
+	}
+	ep := c.endpoint(peer)
+	if ep.Host == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", ep.Host, ep.Port)
 }

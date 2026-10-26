@@ -1,0 +1,30 @@
+datadir="/var/lib/proxysql"
+admin_variables=
+{
+  admin_credentials="admin:placeholder;radmin:placeholder"
+  mysql_ifaces="0.0.0.0:6032"
+}
+mysql_variables=
+{
+  interfaces="0.0.0.0:6033"
+  server_version="8.4.0"
+  monitor_username="root"
+  monitor_password="placeholder"
+  monitor_read_only_interval=1000
+  monitor_read_only_timeout=800
+  monitor_connect_interval=2000
+  monitor_ping_interval=2000
+}
+mysql_servers=
+(
+  { address="db-a", port=3306, hostgroup=10 },
+  { address="db-b", port=3306, hostgroup=11 }
+)
+mysql_replication_hostgroups=
+(
+  { writer_hostgroup=10, reader_hostgroup=11, check_type="read_only", comment="drill" }
+)
+mysql_users=
+(
+  { username="root", password="placeholder", default_hostgroup=10 }
+)

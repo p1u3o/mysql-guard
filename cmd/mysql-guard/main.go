@@ -60,6 +60,10 @@ func runServer(cfg *config.Config) int {
 		log.Error("mysql", "err", err)
 		return 1
 	}
+	peerPool, err := mysql.NewPool(cfg)
+	if err != nil {
+		log.Warn("mysql peer pool partial", "err", err)
+	}
 	px, err := proxysql.NewClient(cfg.ProxySQLConfig())
 	if err != nil {
 		log.Error("proxysql", "err", err)
@@ -68,9 +72,9 @@ func runServer(cfg *config.Config) int {
 	checks := consul.NewAgentChecks(store.Client(), cfg.ConsulServiceID, log)
 	alerts := &notify.Fanout{Ntfy: notify.NewNtfy(cfg.NtfyURL), Consul: checks, Prefix: "guard-"}
 	mreg := metrics.New()
-	exec := actions.NewExecutor(cfg, log, prober, px, store, alerts)
-	rt := guard.NewRuntime(cfg, log, store, lock, prober, exec, mreg)
-	httpsrv := server.New(rt, mreg)
+	exec := actions.NewExecutor(cfg, log, prober, peerPool, px, store, alerts)
+	rt := guard.NewRuntime(cfg, log, store, lock, prober, peerPool, px, exec, mreg)
+	httpsrv := server.New(rt, store, mreg)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -93,6 +97,9 @@ func runServer(cfg *config.Config) int {
 	_ = srv.Shutdown(shutdownCtx)
 	lock.Stop()
 	_ = prober.Close()
+	if peerPool != nil {
+		peerPool.Close()
+	}
 	_ = px.Close()
 	return 0
 }
@@ -120,8 +127,9 @@ func runCLI(args []string) int {
 		return 1
 	}
 	prober, _ := mysql.NewProber(cfg.MySQLDSN, mysql.ProbeConfig{Timeout: cfg.ProbeTimeout})
+	peerPool, _ := mysql.NewPool(cfg)
 	px, _ := proxysql.NewClient(cfg.ProxySQLConfig())
-	exec := actions.NewExecutor(cfg, log, prober, px, store, nil)
+	exec := actions.NewExecutor(cfg, log, prober, peerPool, px, store, nil)
 	ctx := context.Background()
 	local, peer := gtid.Set(""), gtid.Set("")
 	if st, err := prober.ReadGTIDState(ctx); err == nil {
@@ -138,7 +146,7 @@ func runCLI(args []string) int {
 		if target == "" {
 			target = cfg.Peers[0]
 		}
-		_, err := exec.Rejoin(ctx, target, local, peer, true)
+		_, err := exec.Rejoin(ctx, target, cfg.NodeName, local, peer, true)
 		return exitErr(err)
 	default:
 		return 2

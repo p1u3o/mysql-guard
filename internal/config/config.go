@@ -78,7 +78,12 @@ type Config struct {
 	ConsulServiceID   string
 	ConsulServiceName string
 
+	ActionLogMax int
+
 	ProxySQLPeerEndpoints map[string]string // peer name -> host:port for mysql_servers rows
+	MySQLPeerEndpoints    map[string]string // peer name -> host:port for admin connections
+	MySQLTLS              bool
+	MySQLCAFile           string
 
 	Promotable bool
 }
@@ -131,10 +136,12 @@ func Load(args []string) (*Config, error) {
 		ConsulAddr:          "127.0.0.1:8500",
 		MySQLPort:           3306,
 		ConsulServiceName:   "mysql-guard",
+		ActionLogMax:        500,
 	}
 
 	var peers string
 	var proxysqlPeers string
+	var mysqlPeers string
 	fs.StringVar(&c.NodeName, "node", envOr("GUARD_NODE", ""), "this node's logical name")
 	fs.StringVar((*string)(&c.Role), "role", envOr("GUARD_ROLE", "db"), "db or witness")
 	fs.StringVar((*string)(&c.Mode), "mode", envOr("GUARD_MODE", "observe"), "observe, fence, or act")
@@ -170,6 +177,10 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.ConsulServiceID, "consul-service-id", envOr("CONSUL_SERVICE_ID", ""), "register this agent service id and publish TTL checks (recommended)")
 	fs.StringVar(&c.ConsulServiceName, "consul-service-name", envOr("CONSUL_SERVICE_NAME", c.ConsulServiceName), "Consul service name when registering")
 	fs.StringVar(&proxysqlPeers, "proxysql-peer-endpoints", envOr("PROXYSQL_PEER_ENDPOINTS", ""), "peer=host:port map for ProxySQL mysql_servers matching (comma-separated)")
+	fs.StringVar(&mysqlPeers, "mysql-peer-endpoints", envOr("MYSQL_PEER_ENDPOINTS", ""), "peer=host:port map for remote MySQL admin (comma-separated)")
+	fs.BoolVar(&c.MySQLTLS, "mysql-tls", envBool("MYSQL_TLS", false), "enable TLS for peer MySQL connections")
+	fs.StringVar(&c.MySQLCAFile, "mysql-ca-file", envOr("MYSQL_CA_FILE", ""), "CA PEM for peer MySQL TLS")
+	fs.IntVar(&c.ActionLogMax, "action-log-max", c.ActionLogMax, "max entries in Consul action log KV")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -177,6 +188,10 @@ func Load(args []string) (*Config, error) {
 
 	c.Peers = splitCSV(peers)
 	c.ProxySQLPeerEndpoints = parsePeerEndpoints(proxysqlPeers)
+	c.MySQLPeerEndpoints = parsePeerEndpoints(mysqlPeers)
+	if len(c.MySQLPeerEndpoints) == 0 && mysqlPeers == "" {
+		c.MySQLPeerEndpoints = map[string]string{}
+	}
 	if c.ClusterName == "" {
 		return nil, fmt.Errorf("--cluster or GUARD_CLUSTER is required")
 	}

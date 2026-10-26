@@ -16,3 +16,7 @@ func (k KeyPaths) Fenced(node string) string {
 }
 func (k KeyPaths) LastFailover() string { return fmt.Sprintf("mysql/%s/guard/last-failover", k.Cluster) }
 func (k KeyPaths) Maintenance() string  { return fmt.Sprintf("mysql/%s/guard/maintenance", k.Cluster) }
+
+func (k KeyPaths) NeedsRebuild(node string) string {
+	return fmt.Sprintf("mysql/%s/guard/needs-rebuild/%s", k.Cluster, node)
+}

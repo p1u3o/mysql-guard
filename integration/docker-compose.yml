@@ -1,4 +1,3 @@
-# Local integration stack (placeholders). Not wired to full guard act mode yet.
 services:
   consul:
     image: hashicorp/consul:1.19
@@ -6,8 +5,9 @@ services:
     ports:
       - "8500:8500"
 
-  mysql-primary:
+  db-a:
     image: mysql:8.4
+    hostname: db-a
     environment:
       MYSQL_ROOT_PASSWORD: placeholder
       MYSQL_ROOT_HOST: "%"
@@ -21,10 +21,13 @@ services:
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-pplaceholder"]
       interval: 5s
-      retries: 10
+      retries: 15
+    volumes:
+      - ./scripts/init-primary.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
 
-  mysql-replica:
+  db-b:
     image: mysql:8.4
+    hostname: db-b
     environment:
       MYSQL_ROOT_PASSWORD: placeholder
       MYSQL_ROOT_HOST: "%"
@@ -38,5 +41,76 @@ services:
     ports:
       - "33062:3306"
     depends_on:
-      mysql-primary:
+      db-a:
         condition: service_healthy
+    volumes:
+      - ./scripts/bootstrap-replica.sh:/docker-entrypoint-initdb.d/02-replica.sh:ro
+
+  guard-a:
+    build:
+      context: ..
+      dockerfile: integration/Dockerfile
+    depends_on:
+      - consul
+      - db-a
+      - db-b
+    environment:
+      CONSUL_HTTP_ADDR: consul:8500
+    command:
+      - --node=db-a
+      - --role=db
+      - --mode=observe
+      - --cluster=example
+      - --peers=db-a,db-b
+      - --mysql-user=root
+      - --mysql-password=placeholder
+      - --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --http=:9471
+    ports:
+      - "9471:9471"
+
+  guard-b:
+    build:
+      context: ..
+      dockerfile: integration/Dockerfile
+    depends_on:
+      - consul
+      - db-a
+      - db-b
+    environment:
+      CONSUL_HTTP_ADDR: consul:8500
+    command:
+      - --node=db-b
+      - --role=db
+      - --mode=observe
+      - --cluster=example
+      - --peers=db-a,db-b
+      - --mysql-user=root
+      - --mysql-password=placeholder
+      - --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --http=:9472
+    ports:
+      - "9472:9472"
+
+  guard-witness:
+    build:
+      context: ..
+      dockerfile: integration/Dockerfile
+    depends_on:
+      - consul
+      - db-a
+      - db-b
+    environment:
+      CONSUL_HTTP_ADDR: consul:8500
+    command:
+      - --node=witness-1
+      - --role=witness
+      - --mode=observe
+      - --cluster=example
+      - --peers=db-a,db-b
+      - --mysql-user=root
+      - --mysql-password=placeholder
+      - --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --http=:9473
+    ports:
+      - "9473:9473"

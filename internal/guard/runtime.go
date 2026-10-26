@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"mysql-guard/internal/actionlog"
 	"mysql-guard/internal/actions"
 	"mysql-guard/internal/config"
 	"mysql-guard/internal/consul"
@@ -13,6 +14,7 @@ import (
 	"mysql-guard/internal/gtid"
 	"mysql-guard/internal/metrics"
 	"mysql-guard/internal/mysql"
+	"mysql-guard/internal/proxysql"
 	"mysql-guard/internal/replhealth"
 	"mysql-guard/internal/vote"
 
@@ -26,23 +28,30 @@ type Runtime struct {
 	lock    *consul.LeaderLock
 	store   *consul.Store
 	mysql   *mysql.Prober
+	peers   *mysql.Pool
+	proxy   *proxysql.Client
 	exec    *actions.Executor
 	metrics *metrics.Registry
 
-	mu       sync.RWMutex
-	ballot   vote.Ballot
-	status   Status
-	epoch    uint64
-	lastFail time.Time
+	mu          sync.RWMutex
+	lastMaint   bool
+	ballot      vote.Ballot
+	status      Status
+	epoch       uint64
+	lastFail    time.Time
+	lastHealth  time.Time
+	lastWatch   time.Time
 }
 
-func NewRuntime(cfg *config.Config, log *slog.Logger, store *consul.Store, lock *consul.LeaderLock, my *mysql.Prober, exec *actions.Executor, m *metrics.Registry) *Runtime {
+func NewRuntime(cfg *config.Config, log *slog.Logger, store *consul.Store, lock *consul.LeaderLock, my *mysql.Prober, peers *mysql.Pool, px *proxysql.Client, exec *actions.Executor, m *metrics.Registry) *Runtime {
 	return &Runtime{
 		cfg:     cfg,
 		log:     log,
 		lock:    lock,
 		store:   store,
 		mysql:   my,
+		peers:   peers,
+		proxy:   px,
 		exec:    exec,
 		metrics: m,
 		status: Status{Node: cfg.NodeName, Role: string(cfg.Role), Mode: string(cfg.Mode)},
@@ -95,6 +104,10 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 
 	maint, maintMsg, _ := r.store.MaintenanceEnabled(ctx)
 	primary, epochKV, _ := r.store.GetPrimary(ctx)
+	if maint != r.lastMaint {
+		r.logMaintenance(ctx, maint, maintMsg, epochKV)
+		r.lastMaint = maint
+	}
 	topology := r.buildTopology(ctx, primary)
 
 	replSt := replhealth.State{Node: r.cfg.NodeName, ExpectReadOnly: r.cfg.NodeName != primary}
@@ -112,7 +125,8 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 	if r.lock.IsLeader() && r.lock.VerifyLeaderBeforeAction(r.cfg.SessionTTL) {
 		r.decide(ctx, now, dead, ballot, maint, epochKV, topology)
 	}
-	r.refreshStatus(now, dead, maint, maintMsg, primary, epochKV, topology)
+	r.lastHealth = now
+	r.refreshStatus(ctx, now, dead, maint, maintMsg, primary, epochKV, topology)
 }
 
 func (r *Runtime) buildTopology(ctx context.Context, primary string) []NodeTopology {
@@ -123,15 +137,30 @@ func (r *Runtime) buildTopology(ctx context.Context, primary string) []NodeTopol
 			nt.Executed = rec.Executed
 			nt.Retrieved = rec.Retrieved
 		}
-		if p == r.cfg.NodeName {
-			if st, err := r.mysql.ReadGTIDState(ctx); err == nil {
+		var st mysql.GTIDState
+		var err error
+		if r.peers != nil {
+			st, err = r.peers.ReadState(ctx, p)
+		} else if p == r.cfg.NodeName {
+			st, err = r.mysql.ReadGTIDState(ctx)
+		}
+		if err == nil {
+			if st.Executed != "" {
 				nt.Executed = st.Executed
 				nt.Retrieved = st.Retrieved
 				nt.ReadOnly = st.ReadOnly
+				nt.SuperReadOnly = st.SuperReadOnly
 				nt.IOThread = st.IOThread
 				nt.SQLThread = st.SQLThread
 				nt.LagSec = st.LagSeconds
 			}
+		}
+		if p == primary {
+			nt.ProxySQLStatus = "writer"
+			nt.ProxySQLHG = r.cfg.ProxySQLWriterHG
+		} else {
+			nt.ProxySQLStatus = "replica"
+			nt.ProxySQLHG = r.cfg.ProxySQLReaderHG
 		}
 		nt.ReadOnly = nt.ReadOnly || p != primary
 		nodes = append(nodes, nt)
@@ -204,15 +233,44 @@ func (r *Runtime) decide(ctx context.Context, now time.Time, dead int, ballot vo
 	r.mu.Unlock()
 }
 
-func (r *Runtime) refreshStatus(now time.Time, dead int, maint bool, maintMsg, primary string, epoch uint64, nodes []NodeTopology) {
+func (r *Runtime) refreshStatus(ctx context.Context, now time.Time, dead int, maint bool, maintMsg, primary string, epoch uint64, nodes []NodeTopology) {
 	leader := r.lock.IsLeader()
+	renewAge := time.Since(r.lock.LastRenew()).Seconds()
 	r.metrics.Leader.Set(boolToF(leader))
-	r.metrics.SessionRenewAge.Set(time.Since(r.lock.LastRenew()).Seconds())
+	r.metrics.SessionRenewAge.Set(renewAge)
 	r.metrics.Epoch.Set(float64(epoch))
 
+	healthAge := 0.0
+	if !r.lastHealth.IsZero() {
+		healthAge = now.Sub(r.lastHealth).Seconds()
+	}
+	watchAge := 0.0
+	if !r.lastWatch.IsZero() {
+		watchAge = now.Sub(r.lastWatch).Seconds()
+	}
+
+	inst := consul.GuardInstance{
+		Node: r.cfg.NodeName, Role: string(r.cfg.Role), Mode: string(r.cfg.Mode),
+		Leader: leader, LastHeartbeat: now,
+		LoopRenewSec: renewAge, LoopHealthSec: healthAge, LoopWatchSec: watchAge,
+	}
+	_ = r.store.PutGuardInstance(ctx, inst)
+
 	guards := []GuardTopology{{
-		Node: r.cfg.NodeName, Role: string(r.cfg.Role), Leader: leader, Up: true,
+		Node: r.cfg.NodeName, Role: string(r.cfg.Role), Mode: string(r.cfg.Mode),
+		Leader: leader, Follower: !leader, Up: true, LastHeartbeat: now,
+		LoopRenewSec: renewAge, LoopHealthSec: healthAge, LoopWatchSec: watchAge,
 	}}
+	if list, err := r.store.ListGuardInstances(ctx); err == nil && len(list) > 0 {
+		guards = make([]GuardTopology, 0, len(list))
+		for _, g := range list {
+			guards = append(guards, GuardTopology{
+				Node: g.Node, Role: g.Role, Mode: g.Mode, Leader: g.Leader, Follower: !g.Leader, Up: true,
+				LastHeartbeat: g.LastHeartbeat, LoopRenewSec: g.LoopRenewSec,
+				LoopHealthSec: g.LoopHealthSec, LoopWatchSec: g.LoopWatchSec,
+			})
+		}
+	}
 
 	r.mu.Lock()
 	r.status.Leader = leader
@@ -223,9 +281,38 @@ func (r *Runtime) refreshStatus(now time.Time, dead int, maint bool, maintMsg, p
 	r.status.MaintenanceMsg = maintMsg
 	r.status.Nodes = nodes
 	r.status.Guards = guards
+	r.status.Loops = LoopHealth{RenewAgeSec: renewAge, HealthAgeSec: healthAge, WatchAgeSec: watchAge}
+	if r.proxy != nil {
+		if rows, err := r.proxy.ListRuntimeServers(ctx); err == nil {
+			r.status.ProxySQL = rows
+		}
+	}
 	r.status.UpdatedAt = now
 	r.mu.Unlock()
 }
+
+func (r *Runtime) logMaintenance(ctx context.Context, on bool, msg string, epoch uint64) {
+	action := "maintenance_off"
+	reason := "maintenance cleared"
+	if on {
+		action = "maintenance_on"
+		reason = msg
+		if reason == "" {
+			reason = "maintenance enabled"
+		}
+	}
+	_ = r.store.AppendActionLog(ctx, actionlog.Entry{
+		Timestamp: nowUTC(),
+		Epoch:     epoch,
+		Guard:     r.cfg.NodeName,
+		Action:    action,
+		Reason:    reason,
+		Result:    "ok",
+		Step:      "maintenance",
+	}, r.cfg.ActionLogMax)
+}
+
+func nowUTC() time.Time { return time.Now().UTC() }
 
 func (r *Runtime) leaderWatchLoop(ctx context.Context) {
 	client := r.store.Client()
@@ -244,6 +331,9 @@ func (r *Runtime) leaderWatchLoop(ctx context.Context) {
 		if meta != nil {
 			waitIndex = meta.LastIndex
 		}
+		r.mu.Lock()
+		r.lastWatch = time.Now()
+		r.mu.Unlock()
 		if pair != nil && pair.Session != "" {
 			r.log.Debug("leader lock changed", "session", pair.Session)
 		}

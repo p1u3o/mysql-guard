@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mysql-guard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>mysql-guard</h1>
+    <p class="sub">Read-only ops dashboard</p>
+  </header>
+  <nav>
+    <button type="button" data-tab="guards" class="active">Guards</button>
+    <button type="button" data-tab="cluster">Cluster</button>
+    <button type="button" data-tab="actions">Action log</button>
+  </nav>
+  <main>
+    <section id="guards" class="panel active"></section>
+    <section id="cluster" class="panel"></section>
+    <section id="actions" class="panel"></section>
+  </main>
+  <footer><span id="updated"></span></footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,24 +1,44 @@
 package guard
 
-import "time"
+import (
+	"time"
+
+	"mysql-guard/internal/proxysql"
+)
 
 // NodeTopology is one DB peer in /status.
 type NodeTopology struct {
-	Node      string  `json:"node"`
-	Executed  string  `json:"gtid_executed"`
-	Retrieved string  `json:"gtid_retrieved"`
-	LagSec    float64 `json:"lag_seconds"`
-	ReadOnly  bool    `json:"read_only"`
-	IOThread  bool    `json:"io_thread"`
-	SQLThread bool    `json:"sql_thread"`
+	Node           string  `json:"node"`
+	Executed       string  `json:"gtid_executed"`
+	Retrieved      string  `json:"gtid_retrieved"`
+	LagSec         float64 `json:"lag_seconds"`
+	ReadOnly       bool    `json:"read_only"`
+	SuperReadOnly  bool    `json:"super_read_only"`
+	IOThread       bool    `json:"io_thread"`
+	SQLThread      bool    `json:"sql_thread"`
+	ProxySQLStatus string  `json:"proxysql_status,omitempty"`
+	ProxySQLHG     int     `json:"proxysql_hostgroup,omitempty"`
 }
 
 // GuardTopology is a running guard instance.
 type GuardTopology struct {
-	Node   string `json:"node"`
-	Role   string `json:"role"`
-	Leader bool   `json:"leader"`
-	Up     bool   `json:"up"`
+	Node          string    `json:"node"`
+	Role          string    `json:"role"`
+	Mode          string    `json:"mode"`
+	Leader        bool      `json:"leader"`
+	Follower      bool      `json:"follower"`
+	Up            bool      `json:"up"`
+	LastHeartbeat time.Time `json:"last_heartbeat"`
+	LoopRenewSec  float64   `json:"loop_renew_age_sec"`
+	LoopHealthSec float64   `json:"loop_health_age_sec"`
+	LoopWatchSec  float64   `json:"loop_watch_age_sec"`
+}
+
+// LoopHealth summarizes background goroutines.
+type LoopHealth struct {
+	RenewAgeSec  float64 `json:"renew_age_sec"`
+	HealthAgeSec float64 `json:"health_age_sec"`
+	WatchAgeSec  float64 `json:"watch_age_sec"`
 }
 
 // Status is returned by /status.
@@ -33,7 +53,9 @@ type Status struct {
 	Primary        string          `json:"primary"`
 	Maintenance    bool            `json:"maintenance"`
 	MaintenanceMsg string          `json:"maintenance_message,omitempty"`
+	Loops          LoopHealth      `json:"loops"`
 	Nodes          []NodeTopology  `json:"nodes"`
-	Guards         []GuardTopology `json:"guards"`
-	UpdatedAt      time.Time       `json:"updated_at"`
+	Guards         []GuardTopology         `json:"guards"`
+	ProxySQL       []proxysql.RuntimeServer `json:"proxysql_servers,omitempty"`
+	UpdatedAt      time.Time               `json:"updated_at"`
 }

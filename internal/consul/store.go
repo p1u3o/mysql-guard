@@ -107,6 +107,11 @@ func (s *Store) MarkFenced(ctx context.Context, node string, epoch uint64) error
 	return err
 }
 
+func (s *Store) MarkNeedsRebuild(ctx context.Context, node string, reason string) error {
+	_, err := s.client.KV().Put(&capi.KVPair{Key: s.keys.NeedsRebuild(node), Value: []byte(reason)}, nil)
+	return err
+}
+
 // MaintenanceEnabled reads the maintenance KV flag (any non-empty value pauses actions).
 func (s *Store) MaintenanceEnabled(ctx context.Context) (bool, string, error) {
 	pair, _, err := s.client.KV().Get(s.keys.Maintenance(), nil)

@@ -18,7 +18,7 @@ func TestPromoteBlockedErrant(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	my, _ := mysql.NewProber("", mysql.ProbeConfig{})
 	px, _ := proxysql.NewClient(config.ProxySQLSettings{})
-	ex := NewExecutor(cfg, log, my, px, nil, &notify.Fanout{Ntfy: &notify.LogSender{}})
+	ex := NewExecutor(cfg, log, my, nil, px, nil, &notify.Fanout{Ntfy: &notify.LogSender{}})
 	u := gtid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-100")
 	errant := gtid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-110")
 	err := ex.Promote(context.Background(), "db-b", "db-a", errant, u, 1)

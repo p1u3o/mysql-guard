@@ -28,6 +28,18 @@ Set `-consul-service-id` (and optionally `-consul-service-name`, default `mysql-
 
 On a fresh cluster, the **leader** running on the **first peer** (`--peers` order) seeds `mysql/master/<cluster>` when the key is absent, the local instance is writable, and it has no replication source. A log line is emitted when seeding runs.
 
+### Web UI
+
+Open `http://<listen>/` on the same `-http` address. The dashboard polls `/status` and `GET /api/actions` (read-only). Action history is stored in Consul KV `mysql/<cluster>/actions` (cap `--action-log-max`, default 500) via CAS append.
+
+### Remote peer MySQL
+
+`-mysql-peer-endpoints` / `MYSQL_PEER_ENDPOINTS` (`db-a=host:port,db-b=host:port`) with shared `-mysql-user` and password file. Optional `-mysql-tls` and `-mysql-ca-file`. Switchover/rejoin and `/status` cluster view use these connections (local DSN remains fallback for this node).
+
+### Switchover rollback after epoch bump
+
+Before the epoch CAS and master KV update, failed steps roll back (old primary writable, ProxySQL restored). **After epoch bump**, failures do not demote the new primary: the guard runs a **post-epoch abort** — logs `switchover_abort`, sets `mysql/<cluster>/guard/needs-rebuild/<old>`, and alerts. Manual rebuild of the old node is required.
+
 ### ProxySQL admin
 
 Admin updates match `mysql_servers` rows by **hostname and port**. Map logical peer names to ProxySQL backends with `-proxysql-peer-endpoints` / `PROXYSQL_PEER_ENDPOINTS`, e.g. `db-a=10.0.0.1:3306,db-b=10.0.0.2:3306`. Unmapped peers use the peer name as hostname and port `3306`.
@@ -79,7 +91,9 @@ Credentials: `MYSQL_DSN`, `MYSQL_PASSWORD` / `MYSQL_PASSWORD_FILE`, `CONSUL_HTTP
 | Replication alerts → ntfy + Consul TTL checks | Implemented (needs `CONSUL_SERVICE_ID`) |
 | Maintenance mode KV | Implemented |
 | `/status` topology (primary, epoch, nodes, guards) | Implemented (guard discovery TODO) |
-| Planned switchover / rejoin CLI | Partial |
+| Embedded ops Web UI (`/`, `/api/actions`) | Implemented (read-only) |
+| Consul action log KV (`mysql/<cluster>/actions`) | Implemented |
+| Planned switchover / rejoin CLI | Implemented (local MySQL; multi-host orchestration limited) |
 | Consul events, full V2/V3 votes, rate-limit KV | TODO |
 | Nomad + Vault wiring | Example job only (`examples/nomad/mysql-guard.hcl`) |
 

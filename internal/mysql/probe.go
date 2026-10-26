@@ -37,6 +37,8 @@ func NewProber(dsn string, cfg ProbeConfig) (*Prober, error) {
 	return &Prober{db: db, cfg: cfg}, nil
 }
 
+func (p *Prober) DB() *sql.DB { return p.db }
+
 func (p *Prober) Close() error {
 	if p.db != nil {
 		return p.db.Close()
@@ -90,6 +92,7 @@ type GTIDState struct {
 	Executed             string
 	Retrieved            string
 	ReadOnly             bool
+	SuperReadOnly        bool
 	IOThread             bool
 	SQLThread            bool
 	LagSeconds           float64
@@ -103,8 +106,8 @@ func (p *Prober) ReadGTIDState(ctx context.Context) (GTIDState, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.Timeout)
 	defer cancel()
 	var st GTIDState
-	row := p.db.QueryRowContext(ctx, "SELECT @@global.gtid_executed, @@global.gtid_executed, @@global.read_only")
-	if err := row.Scan(&st.Executed, &st.Retrieved, &st.ReadOnly); err != nil {
+	row := p.db.QueryRowContext(ctx, "SELECT @@global.gtid_executed, @@global.gtid_executed, @@global.read_only, @@global.super_read_only")
+	if err := row.Scan(&st.Executed, &st.Retrieved, &st.ReadOnly, &st.SuperReadOnly); err != nil {
 		return GTIDState{}, err
 	}
 	var slaveStatus string

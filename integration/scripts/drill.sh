@@ -6,7 +6,7 @@ cd "$ROOT/integration"
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker not available; running compile and unit tests only"
   (cd "$ROOT" && go build -o /tmp/mysql-guard ./cmd/mysql-guard)
-  (cd "$ROOT" && go test ./internal/decision/... ./internal/errant/... ./internal/rejoin/... -count=1)
+  (cd "$ROOT" && go test ./internal/decision/... ./internal/errant/... ./internal/rejoin/... ./internal/actions/... -count=1)
   echo "Drill complete (offline mode)."
   exit 0
 fi

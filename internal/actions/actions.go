@@ -13,7 +13,6 @@ import (
 	"mysql-guard/internal/mysql"
 	"mysql-guard/internal/notify"
 	"mysql-guard/internal/proxysql"
-	"mysql-guard/internal/rejoin"
 	"mysql-guard/internal/replhealth"
 )
 
@@ -22,21 +21,25 @@ type Executor struct {
 	cfg      *config.Config
 	log      *slog.Logger
 	mysql    *mysql.Prober
+	peers    *mysql.Pool
 	proxy    *proxysql.Client
 	store    *consul.Store
 	alerts   *notify.Fanout
+	alog     *Logger
 	observe  bool
 	fenceOnly bool
 }
 
-func NewExecutor(cfg *config.Config, log *slog.Logger, my *mysql.Prober, px *proxysql.Client, store *consul.Store, alerts *notify.Fanout) *Executor {
+func NewExecutor(cfg *config.Config, log *slog.Logger, my *mysql.Prober, peers *mysql.Pool, px *proxysql.Client, store *consul.Store, alerts *notify.Fanout) *Executor {
 	return &Executor{
 		cfg:       cfg,
 		log:       log,
 		mysql:     my,
+		peers:     peers,
 		proxy:     px,
 		store:     store,
 		alerts:    alerts,
+		alog:      NewLogger(store, cfg.NodeName, cfg.ActionLogMax),
 		observe:   cfg.Mode == config.ModeObserve,
 		fenceOnly: cfg.Mode == config.ModeFence,
 	}
@@ -88,11 +91,13 @@ func (e *Executor) Fence(ctx context.Context, node string, epoch uint64, oldPrim
 }
 
 func (e *Executor) Promote(ctx context.Context, candidate, oldPrimary string, local, primaryExecuted gtid.Set, epoch uint64) error {
-	if on, _ := e.maintenance(ctx); on {
+	if on, msg := e.maintenance(ctx); on {
+		e.actionLog(ctx, epoch, "promote", msg, "blocked", "maintenance")
 		e.log.Info("promote skipped", "reason", "maintenance")
 		return nil
 	}
 	if err := e.checkErrant(ctx, local, primaryExecuted, "promote"); err != nil {
+		e.actionLog(ctx, epoch, "promote", err.Error(), "blocked", "errant_gtid")
 		return err
 	}
 	e.log.Info("promote", "candidate", candidate, "epoch", epoch, "would_only", e.observe || e.fenceOnly)
@@ -144,37 +149,3 @@ func (e *Executor) PublishReplicationAlerts(ctx context.Context, st replhealth.S
 	}
 }
 
-// Switchover performs planned handover with GTID-equal and errant checks.
-func (e *Executor) Switchover(ctx context.Context, newPrimary string, local, peer gtid.Set) error {
-	if on, _ := e.maintenance(ctx); on {
-		return fmt.Errorf("maintenance mode")
-	}
-	if !gtid.Subtract(local, peer).Empty() || !gtid.Subtract(peer, local).Empty() {
-		return fmt.Errorf("switchover requires equal GTID sets")
-	}
-	if err := e.checkErrant(ctx, local, peer, "switchover"); err != nil {
-		return err
-	}
-	e.log.Info("switchover", "new_primary", newPrimary, "mode", e.cfg.Mode)
-	if e.observe {
-		return nil
-	}
-	return e.Promote(ctx, newPrimary, e.cfg.NodeName, local, peer, 0)
-}
-
-// Rejoin checks errant GTIDs and returns a rejoin plan (auto-position or needs-rebuild).
-func (e *Executor) Rejoin(ctx context.Context, source string, local, clusterPrimary gtid.Set, readOnly bool) (rejoin.Plan, error) {
-	if err := e.checkErrant(ctx, local, clusterPrimary, "rejoin"); err != nil {
-		return rejoin.Plan{Outcome: rejoin.OutcomeBlockedErrant, Reason: err.Error()}, err
-	}
-	plan := rejoin.Evaluate(local, clusterPrimary, readOnly)
-	if plan.Alert != "" && e.alerts != nil {
-		_ = e.alerts.Alert(ctx, string(plan.Outcome), plan.Alert, plan.Outcome != rejoin.OutcomeAutoPosition)
-	}
-	e.log.Info("rejoin plan", "outcome", plan.Outcome, "reason", plan.Reason, "source", source, "mode", e.cfg.Mode)
-	if e.observe || plan.Outcome != rejoin.OutcomeAutoPosition {
-		return plan, nil
-	}
-	// TODO: CHANGE REPLICATION SOURCE TO ... SOURCE_AUTO_POSITION=1
-	return plan, nil
-}

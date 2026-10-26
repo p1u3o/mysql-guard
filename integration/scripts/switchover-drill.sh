@@ -275,6 +275,47 @@ write_row db-b d9b; wait_for 30 "d9b on db-a" row_on db-a d9b; wait_for 30 "GTID
 snap 09-slow-start
 pass "drill 9b: dropped connection after START REPLICA -> state verified, ok, epoch $E->$(kv_epoch), no needs-rebuild, gtid=$(gtid db-a)"
 
+log "=== Drill 10: replica with duplicate server_id -> stalled, flagged, never promoted ==="
+P=$(kv_primary); R=db-b; [ "$P" = db-b ] && R=db-a
+PSID=$(sqlq "$P" "SELECT @@server_id"); RSID=$(sqlq "$R" "SELECT @@server_id")
+[ -n "$PSID" ] && [ "$PSID" != "$RSID" ] || fail "server ids P=$PSID R=$RSID"
+wait_for 30 "GTIDs match before drill 10" gtids_match
+# Reproduce the 2026-10-26 incident: the replica's server_id equals the originating
+# server_id of events it must apply (not the source's own id, which MySQL rejects at
+# connect). The IO thread silently skips them: threads ON, no error, no progress.
+DUP=4242
+sqlq "$R" "STOP REPLICA; SET GLOBAL server_id=$DUP; START REPLICA" || fail "set server_id $DUP on $R"
+wait_for 30 "$R threads ON" replica_running "$R"
+sqlq "$P" "SET GLOBAL server_id=$DUP" || fail "set origin id on $P"
+write_row "$P" d10-a; write_row "$P" d10-b
+sqlq "$P" "SET GLOBAL server_id=$PSID" || fail "restore $P server_id"
+sleep 3
+row_on "$R" d10-a && fail "$R applied d10-a despite duplicate server_id (repro failed)"
+stalled_on() { for p in 9471 9472; do [ "$(status "$p" | jq -r --arg n "$R" '.nodes[] | select(.node==$n) | .stalled')" = true ] || return 1; done; }
+T0=$(date +%s)
+wait_for 40 "$R flagged stalled on both DB guards (witness has no topology)" stalled_on
+log "stalled flagged after $(( $(date +%s) - T0 ))s: $(status 9471 | jq -c --arg n "$R" '.nodes[] | select(.node==$n) | {stalled,stall_reason,gtid_gap_to_writer,gtid_retrieved}')"
+replica_running "$R" || fail "$R threads not ON (stall must be threads ON)"
+docker compose logs --no-color guard-a guard-b 2>/dev/null | grep -q 'repl_stalled' || fail "repl_stalled alert not logged"
+E=$(kv_epoch); NF=$(count_ok failover)
+docker compose stop "$P"
+sleep 25
+[ "$(kv_primary)" = "$P" ] || fail "primary moved to stalled $R"
+[ "$(kv_epoch)" = "$E" ] || fail "epoch bumped $E->$(kv_epoch)"
+[ "$(count_ok failover)" = "$NF" ] || fail "failover ok logged with stalled candidate"
+actions | jq -e '[.entries[] | select(.step=="stalled_candidate" and .result=="blocked")] | length >= 1' >/dev/null || fail "stalled_candidate block not logged"
+[ "$(ro "$R")" != "00" ] || fail "$R became writable"
+docker compose start "$P"
+wait_for 120 "$P back" sh -c "docker compose exec -T $P mysql -uroot -pplaceholder -e 'SELECT 1'"
+sqlq "$R" "STOP REPLICA; SET GLOBAL server_id=$RSID; START REPLICA" || fail "restore server_id on $R"
+wait_for 60 "$R replicating" replica_running "$R"
+wait_for 60 "d10-b on $R" row_on "$R" d10-b
+wait_for 30 "GTIDs match after drill 10" gtids_match
+unstalled() { for p in 9471 9472; do [ "$(status "$p" | jq -r --arg n "$R" '.nodes[] | select(.node==$n) | .stalled')" = false ] || return 1; done; }
+wait_for 30 "$R stall cleared" unstalled
+snap 10-dup-server-id
+pass "drill 10: $R with server_id=$DUP (= origin id of new events from $P) flagged stalled, failover refused while $P down (epoch $E), recovered, gtid=$(gtid "$P")"
+
 SK=$(count_skipped)
 [ "$SK" = 0 ] || fail "$SK action log entries with result=skipped"
 one_leader || fail "leadership not single at end"

@@ -177,3 +177,9 @@ func (e *Executor) replAlertsChanged(alerts []replhealth.Alert) bool {
 	e.replInit, e.lastReplKey = true, key
 	return true
 }
+
+// LogBlocked records a blocked automatic action in the action log.
+func (e *Executor) LogBlocked(ctx context.Context, epoch uint64, action, reason, step string) {
+	e.actionLog(ctx, epoch, action, reason, "blocked", step)
+	e.log.Warn(action+" blocked", "step", step, "reason", reason)
+}

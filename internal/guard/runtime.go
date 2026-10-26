@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"mysql-guard/internal/stall"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +47,9 @@ type Runtime struct {
 	writable   map[string]int
 	deadTicks  int
 	health     HealthReporter
+	stall      *stall.Tracker
+	stalled    map[string]string // node -> reason, this tick
+	lastWriter consul.WriterGTID // last-known writer executed set
 }
 
 // Version is the build version shown in /status (set from main via ldflags).
@@ -68,6 +73,7 @@ type tickHealth struct {
 	leader      bool
 	primary     string
 	epoch       uint64
+	stalled     []string
 }
 
 // guardCheckStatus maps a tick to the TTL check status (Consul HealthPassing/Warning/Critical).
@@ -86,6 +92,9 @@ func guardCheckStatus(t tickHealth) (string, string) {
 		if t.probe == vote.ProbeSlow {
 			return "warning", "local mysql slow"
 		}
+	}
+	if len(t.stalled) > 0 {
+		return "warning", "replica stalled (never a promotion candidate): " + strings.Join(t.stalled, ",")
 	}
 	return "passing", fmt.Sprintf("ok role=%s leader=%t primary=%s epoch=%d", t.role, t.leader, t.primary, t.epoch)
 }
@@ -192,6 +201,8 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 	obs := map[string]peerObs{}
 	if checks.MySQL {
 		topology, obs = r.buildTopology(ctx, primary)
+		r.trackStalls(ctx, now, primary, epochKV, topology, obs)
+		th.stalled = r.stalledNodes()
 	}
 	if checks.Replication {
 		replSt := replhealth.State{Node: r.cfg.NodeName, ExpectReadOnly: primary != "" && r.cfg.NodeName != primary}
@@ -203,6 +214,9 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 			replSt.IOThreadOn = st.IOThread || !replSt.ExpectReadOnly
 			replSt.SQLThreadOn = st.SQLThread || !replSt.ExpectReadOnly
 			replSt.LagSeconds = st.LagSeconds
+			r.mu.RLock()
+			replSt.StallReason, replSt.Stalled = r.stalled[r.cfg.NodeName], r.stalled[r.cfg.NodeName] != ""
+			r.mu.RUnlock()
 			r.exec.PublishReplicationAlerts(ctx, replSt)
 		}
 	}
@@ -382,6 +396,14 @@ func (r *Runtime) decide(ctx context.Context, now time.Time, maint bool, primary
 	cands := map[string]gtid.Set{}
 	for _, p := range r.cfg.Peers {
 		if o := obs[p]; p != primary && candidateUsable(o) {
+			if reason := r.stallReason(p); reason != "" {
+				r.exec.LogBlocked(ctx, epoch, "failover", "candidate "+p+" stalled: "+reason, "stalled_candidate")
+				continue
+			}
+			if ok, why := r.supersetOK(ctx, primary, epoch, p, o); !ok {
+				r.exec.LogBlocked(ctx, epoch, "failover", why, "superset_gate")
+				continue
+			}
 			cands[p] = gtid.Parse(o.st.Executed)
 		}
 	}
@@ -531,4 +553,98 @@ func (r *Runtime) leaderWatchLoop(ctx context.Context) {
 			r.log.Debug("leader lock changed", "session", pair.Session)
 		}
 	}
+}
+
+// trackStalls updates the stall tracker for every replica and publishes the
+// last-known writer's executed set (in memory and in Consul when leader).
+func (r *Runtime) trackStalls(ctx context.Context, now time.Time, primary string, epoch uint64, topo []NodeTopology, obs map[string]peerObs) {
+	r.mu.Lock()
+	if r.stall == nil {
+		after := r.cfg.StallAfter
+		if after <= 0 {
+			after = 30 * time.Second
+		}
+		r.stall = stall.New(after)
+	}
+	tr := r.stall
+	r.mu.Unlock()
+	po, srcKnown := obs[primary]
+	srcKnown = srcKnown && primary != "" && po.err == nil
+	src := gtid.Set("")
+	if srcKnown {
+		src = gtid.Parse(po.st.Executed)
+	}
+	stalled := map[string]string{}
+	for i := range topo {
+		p := topo[i].Node
+		if p == primary {
+			continue
+		}
+		o := obs[p]
+		in := stall.Obs{Node: p, SourceKnown: srcKnown && o.err == nil && o.st.ReplKnown, SourceExecuted: src,
+			Executed: gtid.Parse(o.st.Executed), Retrieved: gtid.Parse(o.st.Retrieved), ThreadsOn: o.st.IOThread && o.st.SQLThread}
+		res := tr.Observe(now, in)
+		topo[i].Stalled, topo[i].StallReason, topo[i].GapToWriter = res.Stalled, res.Reason, res.Gap
+		if res.Stalled {
+			stalled[p] = res.Reason
+		}
+	}
+	r.mu.Lock()
+	r.stalled = stalled
+	changed := false
+	if srcKnown && !po.st.ReadOnly && (r.lastWriter.Node != primary || r.lastWriter.Epoch != epoch || string(src) != r.lastWriter.Executed) {
+		r.lastWriter = consul.WriterGTID{Node: primary, Epoch: epoch, Executed: string(src), UpdatedAt: now}
+		changed = true
+	}
+	lw := r.lastWriter
+	r.mu.Unlock()
+	if changed && r.lock.IsLeader() && r.cfg.Mode != config.ModeObserve {
+		if err := r.store.PutWriterGTID(ctx, lw); err != nil {
+			r.log.Warn("publish last writer gtid", "err", err)
+		}
+	}
+}
+
+func (r *Runtime) stalledNodes() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []string
+	for _, p := range r.cfg.Peers {
+		if r.stalled[p] != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (r *Runtime) stallReason(node string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.stalled[node]
+}
+
+// supersetOK refuses a candidate whose executed+retrieved set is not a superset
+// of the last-known writer's executed set (same writer and epoch only).
+func (r *Runtime) supersetOK(ctx context.Context, primary string, epoch uint64, cand string, o peerObs) (bool, string) {
+	r.mu.RLock()
+	lw := r.lastWriter
+	r.mu.RUnlock()
+	if lw.Node != primary || lw.Epoch != epoch {
+		if rec, err := r.store.GetWriterGTID(ctx); err == nil && rec != nil {
+			lw = *rec
+		}
+	}
+	return supersetCheck(lw, primary, epoch, cand, gtid.Parse(o.st.Executed), gtid.Parse(o.st.Retrieved))
+}
+
+func supersetCheck(lw consul.WriterGTID, primary string, epoch uint64, cand string, executed, retrieved gtid.Set) (bool, string) {
+	if lw.Node != primary || lw.Epoch != epoch || lw.Executed == "" {
+		return true, ""
+	}
+	have := gtid.Union(executed, retrieved)
+	missing := gtid.Subtract(gtid.Set(lw.Executed), have)
+	if missing.Empty() {
+		return true, ""
+	}
+	return false, fmt.Sprintf("candidate %s not a superset of last-known writer %s epoch %d: missing %s", cand, lw.Node, lw.Epoch, missing)
 }

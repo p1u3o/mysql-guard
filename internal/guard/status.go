@@ -19,6 +19,9 @@ type NodeTopology struct {
 	ReplError      string  `json:"repl_error,omitempty"`
 	IOThread       *bool   `json:"io_thread"` // null when replication state is unknown
 	SQLThread      *bool   `json:"sql_thread"`
+	Stalled        bool    `json:"stalled"`
+	StallReason    string  `json:"stall_reason,omitempty"`
+	GapToWriter    int64   `json:"gtid_gap_to_writer"`
 	ProxySQLStatus string  `json:"proxysql_status,omitempty"`
 	ProxySQLHG     int     `json:"proxysql_hostgroup,omitempty"`
 }

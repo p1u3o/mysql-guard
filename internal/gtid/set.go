@@ -54,7 +54,8 @@ func parseMap(set string) map[string][]interval {
 		if !ok {
 			continue
 		}
-		out[uuid] = parseIntervals(seq)
+		// a UUID may appear more than once (e.g. a concatenated union): merge, never overwrite
+		out[uuid] = mergeIntervals(append(out[uuid], parseIntervals(seq)...))
 	}
 	return out
 }
@@ -211,4 +212,35 @@ func ComparePeers(candidates map[string]Set) (winner string, ok bool) {
 		return name, true
 	}
 	return "", false
+}
+
+// Count returns the number of transactions in the set.
+func (s Set) Count() int64 {
+	var n int64
+	for _, ivs := range parseMap(string(s)) {
+		for _, iv := range ivs {
+			n += iv.end - iv.start + 1
+		}
+	}
+	return n
+}
+
+// Superset reports whether s contains every transaction of other.
+func (s Set) Superset(other Set) bool { return Subtract(other, s).Empty() }
+
+// Union returns a set containing every transaction of a and b.
+func Union(a, b Set) Set {
+	switch {
+	case a.Empty():
+		return b
+	case b.Empty():
+		return a
+	}
+	m := parseMap(string(a) + "," + string(b))
+	parts := make([]string, 0, len(m))
+	for uuid, ivs := range m {
+		parts = append(parts, uuid+":"+formatIntervals(ivs))
+	}
+	sort.Strings(parts)
+	return Set(strings.Join(parts, ","))
 }

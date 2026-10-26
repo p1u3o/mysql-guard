@@ -87,6 +87,7 @@ type Config struct {
 
 	NtfyURL           string
 	ReplLagAlertSec   float64
+	StallAfter        time.Duration
 	ConsulServiceID   string
 	ConsulServiceName string
 
@@ -144,6 +145,7 @@ func Load(args []string) (*Config, error) {
 		ProxySQLWriterHG:   10,
 		ProxySQLReaderHG:   11,
 		ReplLagAlertSec:    30,
+		StallAfter:         30 * time.Second,
 		HTTPListen:         ":9470",
 		ConsulAddr:         "127.0.0.1:8500",
 		MySQLPort:          3306,
@@ -191,6 +193,7 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.ProxySQLWriterHG, "proxysql-writer-hg", c.ProxySQLWriterHG, "writer hostgroup id")
 	fs.IntVar(&c.ProxySQLReaderHG, "proxysql-reader-hg", c.ProxySQLReaderHG, "reader hostgroup id")
 	fs.StringVar(&c.NtfyURL, "ntfy-url", envOr("NTFY_URL", ""), "ntfy topic URL for alerts")
+	fs.DurationVar(&c.StallAfter, "stall-after", envDuration("STALL_AFTER", c.StallAfter), "replica with threads ON whose GTID gap to the writer does not shrink for this long is stalled (alert, warning check, never a promotion candidate)")
 	fs.Float64Var(&c.ReplLagAlertSec, "repl-lag-alert-sec", c.ReplLagAlertSec, "replication lag alert threshold")
 	fs.StringVar(&c.ConsulServiceID, "consul-service-id", envOr("CONSUL_SERVICE_ID", ""), "register this agent service id and publish TTL checks (recommended)")
 	fs.StringVar(&c.ConsulServiceName, "consul-service-name", envOr("CONSUL_SERVICE_NAME", c.ConsulServiceName), "Consul service name when registering")

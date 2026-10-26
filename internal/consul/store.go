@@ -152,3 +152,29 @@ func (s *Store) GetPrimary(ctx context.Context) (string, uint64, error) {
 	}
 	return node, epoch, nil
 }
+
+// WriterGTID is the last-known writer's executed set (promotion superset guard).
+type WriterGTID struct {
+	Node      string    `json:"node"`
+	Epoch     uint64    `json:"epoch"`
+	Executed  string    `json:"executed"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (s *Store) PutWriterGTID(ctx context.Context, rec WriterGTID) error {
+	b, _ := json.Marshal(rec)
+	_, err := s.client.KV().Put(&capi.KVPair{Key: s.keys.LastWriterGTID(), Value: b}, nil)
+	return err
+}
+
+func (s *Store) GetWriterGTID(ctx context.Context) (*WriterGTID, error) {
+	pair, _, err := s.client.KV().Get(s.keys.LastWriterGTID(), nil)
+	if err != nil || pair == nil {
+		return nil, err
+	}
+	var rec WriterGTID
+	if err := json.Unmarshal(pair.Value, &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}

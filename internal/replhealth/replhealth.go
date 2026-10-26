@@ -17,6 +17,9 @@ type State struct {
 	// holds why). Unknown never produces stopped alerts.
 	Unknown    bool
 	UnknownErr string
+	// Stalled: threads ON but the GTID gap to the writer is not shrinking.
+	Stalled     bool
+	StallReason string
 }
 
 // Alert is a replication hygiene issue.
@@ -42,6 +45,9 @@ func Evaluate(st State, cfg Config) []Alert {
 	}
 	if !st.Unknown && !st.SQLThreadOn {
 		out = append(out, Alert{Severity: "critical", Code: "repl_sql_stopped", Message: fmt.Sprintf("%s: SQL thread not running", st.Node)})
+	}
+	if st.Stalled {
+		out = append(out, Alert{Severity: "critical", Code: "repl_stalled", Message: fmt.Sprintf("%s: replica stalled: %s", st.Node, st.StallReason)})
 	}
 	if !st.Unknown && cfg.MaxLagSeconds > 0 && st.LagSeconds > cfg.MaxLagSeconds {
 		out = append(out, Alert{Severity: "warning", Code: "repl_lag", Message: fmt.Sprintf("%s: lag %.1fs over %.1fs", st.Node, st.LagSeconds, cfg.MaxLagSeconds)})

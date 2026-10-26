@@ -73,19 +73,23 @@ func (s *Store) GetEpoch(ctx context.Context) (uint64, error) {
 
 func (s *Store) CasBumpEpoch(ctx context.Context, expect uint64) (uint64, error) {
 	key := s.keys.WriterEpoch()
-	pair, meta, err := s.client.KV().Get(key, nil)
+	pair, _, err := s.client.KV().Get(key, nil)
 	if err != nil {
 		return 0, err
 	}
 	var cur uint64
-	if pair != nil && len(pair.Value) > 0 {
-		_, _ = fmt.Sscanf(string(pair.Value), "%d", &cur)
+	var index uint64 // 0 = create only if absent
+	if pair != nil {
+		index = pair.ModifyIndex
+		if len(pair.Value) > 0 {
+			_, _ = fmt.Sscanf(string(pair.Value), "%d", &cur)
+		}
 	}
 	if cur != expect {
 		return cur, fmt.Errorf("epoch CAS mismatch: have %d expect %d", cur, expect)
 	}
 	next := cur + 1
-	ok, _, err := s.client.KV().CAS(&capi.KVPair{Key: key, Value: []byte(fmt.Sprintf("%d", next)), ModifyIndex: meta.LastIndex}, nil)
+	ok, _, err := s.client.KV().CAS(&capi.KVPair{Key: key, Value: []byte(fmt.Sprintf("%d", next)), ModifyIndex: index}, nil)
 	if err != nil {
 		return 0, err
 	}

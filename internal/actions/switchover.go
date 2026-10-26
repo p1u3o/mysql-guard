@@ -16,11 +16,13 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 		return fmt.Errorf("maintenance mode")
 	}
 	oldPrimary, newPrimary := mysql.ResolveOldNewPrimary(e.cfg, newPrimaryArg)
-	if !gtid.Subtract(local, peer).Empty() || !gtid.Subtract(peer, local).Empty() {
-		e.actionLog(ctx, 0, "switchover", "GTID sets must match", "blocked", "precheck")
-		return fmt.Errorf("switchover requires equal GTID sets")
+	// The new primary must not hold transactions the old primary lacks; any lag
+	// is drained after the old primary is made read-only.
+	if extra := gtid.Subtract(peer, local); !extra.Empty() {
+		e.actionLog(ctx, 0, "switchover", "new primary has GTIDs missing on old primary: "+string(extra), "blocked", "precheck")
+		return fmt.Errorf("switchover blocked: target has extra GTIDs %s", extra)
 	}
-	if err := e.checkErrant(ctx, local, peer, "switchover"); err != nil {
+	if err := e.checkErrant(ctx, peer, local, "switchover"); err != nil {
 		e.actionLog(ctx, 0, "switchover", err.Error(), "blocked", "errant_gtid")
 		return err
 	}
@@ -60,7 +62,12 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 		rollback()
 		return err
 	}
-	targetGTID, _ := newAdm.GTIDExecuted(ctx)
+	targetGTID, err := oldAdm.GTIDExecuted(ctx)
+	if err != nil {
+		e.actionLog(ctx, 0, "switchover", err.Error(), "error", "read_old_gtid")
+		rollback()
+		return err
+	}
 	if err := newAdm.WaitExecuted(ctx, targetGTID, e.cfg.MaxApplyLag*2); err != nil {
 		e.actionLog(ctx, 0, "switchover", err.Error(), "error", "wait_gtid")
 		rollback()
@@ -100,7 +107,7 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 	if err := oldAdm.StartReplica(ctx); err != nil {
 		return e.abortSwitchoverPostEpoch(ctx, newEpoch, oldPrimary, newPrimary, err.Error())
 	}
-	e.actionLog(ctx, newEpoch, "switchover", "complete", "ok", "end")
+	e.actionLog(ctx, newEpoch, "switchover", fmt.Sprintf("%s -> %s complete at epoch %d", oldPrimary, newPrimary, newEpoch), "ok", "end")
 	return nil
 }
 

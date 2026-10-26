@@ -10,9 +10,9 @@ import (
 
 // Pool holds one connection per peer (and local fallback).
 type Pool struct {
-	cfg   *config.Config
-	dbs   map[string]*sql.DB
-	mu    sync.Mutex
+	cfg *config.Config
+	dbs map[string]*sql.DB
+	mu  sync.Mutex
 }
 
 func NewPool(cfg *config.Config) (*Pool, error) {

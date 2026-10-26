@@ -12,8 +12,8 @@ import (
 	"mysql-guard/internal/actions"
 	"mysql-guard/internal/config"
 	"mysql-guard/internal/consul"
-	"mysql-guard/internal/guard"
 	"mysql-guard/internal/gtid"
+	"mysql-guard/internal/guard"
 	"mysql-guard/internal/metrics"
 	"mysql-guard/internal/mysql"
 	"mysql-guard/internal/notify"
@@ -79,7 +79,10 @@ func runServer(cfg *config.Config) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	go lock.RunRenewalLoop()
+	// Only DB guards compete for leadership; witnesses never act on MySQL.
+	if cfg.Role == config.RoleDB {
+		go lock.RunRenewalLoop()
+	}
 	rt.Run(ctx)
 
 	srv := &http.Server{Addr: cfg.HTTPListen, Handler: httpsrv.Handler(), ReadHeaderTimeout: 5 * time.Second}
@@ -131,22 +134,32 @@ func runCLI(args []string) int {
 	px, _ := proxysql.NewClient(cfg.ProxySQLConfig())
 	exec := actions.NewExecutor(cfg, log, prober, peerPool, px, store, nil)
 	ctx := context.Background()
-	local, peer := gtid.Set(""), gtid.Set("")
-	if st, err := prober.ReadGTIDState(ctx); err == nil {
-		local = gtid.Parse(st.Executed)
-		peer = local
+	readExecuted := func(peer string) gtid.Set {
+		if peerPool != nil {
+			if st, err := peerPool.ReadState(ctx, peer); err == nil {
+				return gtid.Parse(st.Executed)
+			}
+		}
+		if st, err := prober.ReadGTIDState(ctx); err == nil && peer == cfg.NodeName {
+			return gtid.Parse(st.Executed)
+		}
+		return gtid.Set("")
 	}
 	switch sub {
 	case "switchover", "handover":
 		if target == "" {
 			target = cfg.Peers[len(cfg.Peers)-1]
 		}
-		return exitErr(exec.Switchover(ctx, target, local, peer))
+		oldPrimary, newPrimary := mysql.ResolveOldNewPrimary(cfg, target)
+		if cur, _, err := store.GetPrimary(ctx); err == nil && cur != "" && cur != newPrimary {
+			oldPrimary = cur
+		}
+		return exitErr(exec.Switchover(ctx, newPrimary, readExecuted(oldPrimary), readExecuted(newPrimary)))
 	case "rejoin":
 		if target == "" {
 			target = cfg.Peers[0]
 		}
-		_, err := exec.Rejoin(ctx, target, cfg.NodeName, local, peer, true)
+		_, err := exec.Rejoin(ctx, target, cfg.NodeName, readExecuted(cfg.NodeName), readExecuted(target), true)
 		return exitErr(err)
 	default:
 		return 2

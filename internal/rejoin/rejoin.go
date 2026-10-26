@@ -11,8 +11,8 @@ import (
 type Outcome string
 
 const (
-	OutcomeAutoPosition Outcome = "auto-position"
-	OutcomeNeedsRebuild Outcome = "needs-rebuild"
+	OutcomeAutoPosition  Outcome = "auto-position"
+	OutcomeNeedsRebuild  Outcome = "needs-rebuild"
 	OutcomeBlockedErrant Outcome = "blocked-errant"
 )
 

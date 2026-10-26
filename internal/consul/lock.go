@@ -8,30 +8,88 @@ import (
 	capi "github.com/hashicorp/consul/api"
 )
 
-// LeaderLock acquires mysql/guard/leader with session renewal in a dedicated goroutine.
+// lockBackend is the subset of Consul session/KV used by LeaderLock.
+// Every call is non-blocking so the renewal loop never stalls while
+// another session holds the lock.
+type lockBackend interface {
+	CreateSession(name string, ttl, delay time.Duration) (string, error)
+	// RenewSession returns false when the session no longer exists.
+	RenewSession(id string) (bool, error)
+	DestroySession(id string) error
+	// Acquire attempts KV acquire; returns false if held by another session.
+	Acquire(key, session string, value []byte) (bool, error)
+	Release(key, session string) error
+	// Holder returns the session currently holding key ("" if none).
+	Holder(key string) (string, error)
+}
+
+type consulBackend struct{ c *capi.Client }
+
+func (b consulBackend) CreateSession(name string, ttl, delay time.Duration) (string, error) {
+	id, _, err := b.c.Session().Create(&capi.SessionEntry{
+		Name:      name,
+		TTL:       ttl.String(),
+		LockDelay: delay,
+		Behavior:  capi.SessionBehaviorRelease,
+	}, nil)
+	return id, err
+}
+
+func (b consulBackend) RenewSession(id string) (bool, error) {
+	e, _, err := b.c.Session().Renew(id, nil)
+	if err != nil {
+		return false, err
+	}
+	return e != nil, nil
+}
+
+func (b consulBackend) DestroySession(id string) error {
+	_, err := b.c.Session().Destroy(id, nil)
+	return err
+}
+
+func (b consulBackend) Acquire(key, session string, value []byte) (bool, error) {
+	ok, _, err := b.c.KV().Acquire(&capi.KVPair{Key: key, Value: value, Session: session}, nil)
+	return ok, err
+}
+
+func (b consulBackend) Release(key, session string) error {
+	_, _, err := b.c.KV().Release(&capi.KVPair{Key: key, Session: session}, nil)
+	return err
+}
+
+func (b consulBackend) Holder(key string) (string, error) {
+	p, _, err := b.c.KV().Get(key, nil)
+	if err != nil || p == nil {
+		return "", err
+	}
+	return p.Session, nil
+}
+
+// LeaderLock holds mysql/<cluster>/guard/leader via a Consul session.
+// Each tick renews (or recreates) the session and attempts a non-blocking
+// acquire, so exactly one guard is leader and followers keep retrying.
 type LeaderLock struct {
-	store      *Store
+	backend    lockBackend
+	key        string
 	sessionTTL time.Duration
 	lockDelay  time.Duration
 	node       string
 
-	mu         sync.RWMutex
-	leader     bool
-	sessionID  string
-	lastRenew  time.Time
-	stopCh     chan struct{}
-	lock       *capi.Lock
-	leaderLost <-chan struct{}
+	mu        sync.RWMutex
+	leader    bool
+	sessionID string
+	lastRenew time.Time
+	stopCh    chan struct{}
+	stopOnce  sync.Once
 }
 
 func NewLeaderLock(store *Store, node string, ttl, delay time.Duration) *LeaderLock {
-	return &LeaderLock{
-		store:      store,
-		sessionTTL: ttl,
-		lockDelay:  delay,
-		node:       node,
-		stopCh:     make(chan struct{}),
-	}
+	return newLeaderLock(consulBackend{c: store.Client()}, store.Keys().LeaderLock(), node, ttl, delay)
+}
+
+func newLeaderLock(b lockBackend, key, node string, ttl, delay time.Duration) *LeaderLock {
+	return &LeaderLock{backend: b, key: key, sessionTTL: ttl, lockDelay: delay, node: node, stopCh: make(chan struct{})}
 }
 
 func (l *LeaderLock) IsLeader() bool {
@@ -52,80 +110,92 @@ func (l *LeaderLock) SessionID() string {
 	return l.sessionID
 }
 
-// RunRenewalLoop must not block on MySQL probes.
-func (l *LeaderLock) RunRenewalLoop() {
-	renewEvery := l.sessionTTL / 3
-	if renewEvery < time.Second {
-		renewEvery = time.Second
+func (l *LeaderLock) renewEvery() time.Duration {
+	d := l.sessionTTL / 3
+	if d < time.Second {
+		d = time.Second
 	}
-	ticker := time.NewTicker(renewEvery)
-	defer ticker.Stop()
+	return d
+}
 
+// RunRenewalLoop must not block on MySQL probes or on the lock itself.
+func (l *LeaderLock) RunRenewalLoop() {
+	l.Tick()
+	ticker := time.NewTicker(l.renewEvery())
+	defer ticker.Stop()
 	for {
 		select {
 		case <-l.stopCh:
 			l.release()
 			return
 		case <-ticker.C:
-			l.tick()
+			l.Tick()
 		}
 	}
 }
 
-func (l *LeaderLock) Stop() { close(l.stopCh) }
+func (l *LeaderLock) Stop() { l.stopOnce.Do(func() { close(l.stopCh) }) }
 
-func (l *LeaderLock) tick() {
-	if l.leaderLost != nil {
-		select {
-		case <-l.leaderLost:
-			l.setLeader(false, "")
-			l.leaderLost = nil
-		default:
-		}
-	}
-	if l.lock == nil {
-		lock, err := l.store.Client().LockOpts(&capi.LockOptions{
-			Key:         l.store.Keys().LeaderLock(),
-			SessionName: fmt.Sprintf("mysql-guard-%s", l.node),
-			SessionTTL:  l.sessionTTL.String(),
-			LockDelay:   l.lockDelay,
-		})
+// Tick renews the session and attempts a non-blocking acquire. Exported for tests.
+func (l *LeaderLock) Tick() {
+	l.mu.RLock()
+	sess := l.sessionID
+	l.mu.RUnlock()
+
+	if sess != "" {
+		alive, err := l.backend.RenewSession(sess)
 		if err != nil {
-			l.setLeader(false, "")
+			// Consul unreachable: we cannot prove we still hold the lock.
+			l.set(false, sess, false)
 			return
 		}
-		l.lock = lock
+		if !alive {
+			sess = ""
+		}
 	}
-	ch, err := l.lock.Lock(l.stopCh)
-	if err != nil || ch == nil {
-		l.setLeader(false, "")
+	if sess == "" {
+		id, err := l.backend.CreateSession(fmt.Sprintf("mysql-guard-%s", l.node), l.sessionTTL, l.lockDelay)
+		if err != nil {
+			l.set(false, "", false)
+			return
+		}
+		sess = id
+	}
+	held, err := l.backend.Acquire(l.key, sess, []byte(l.node))
+	if err != nil {
+		l.set(false, sess, true)
 		return
 	}
-	l.leaderLost = ch
-	l.setLeader(true, l.lockOptsSession())
-}
-
-func (l *LeaderLock) lockOptsSession() string {
-	if l.lock == nil {
-		return ""
+	if !held {
+		// Re-acquire by the current holder returns true; anything else means a follower.
+		if h, herr := l.backend.Holder(l.key); herr == nil && h == sess {
+			held = true
+		}
 	}
-	// Session id is tracked internally on Lock after acquisition.
-	return l.sessionID
+	l.set(held, sess, true)
 }
 
 func (l *LeaderLock) release() {
-	if l.lock != nil && l.leader {
-		_ = l.lock.Unlock()
+	l.mu.Lock()
+	sess, leader := l.sessionID, l.leader
+	l.leader = false
+	l.mu.Unlock()
+	if sess == "" {
+		return
 	}
+	if leader {
+		_ = l.backend.Release(l.key, sess)
+	}
+	_ = l.backend.DestroySession(sess)
 }
 
-func (l *LeaderLock) setLeader(v bool, sess string) {
+func (l *LeaderLock) set(leader bool, sess string, renewed bool) {
 	l.mu.Lock()
-	l.leader = v
-	if sess != "" {
-		l.sessionID = sess
+	l.leader = leader
+	l.sessionID = sess
+	if renewed {
+		l.lastRenew = time.Now()
 	}
-	l.lastRenew = time.Now()
 	l.mu.Unlock()
 }
 

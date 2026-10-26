@@ -9,21 +9,21 @@ import (
 
 // ScenarioInput bundles state for failure-scenario evaluation (table-driven tests).
 type ScenarioInput struct {
-	Name           string
-	Now            time.Time
-	Ballot         vote.Ballot
-	VotesNeeded    int
+	Name            string
+	Now             time.Time
+	Ballot          vote.Ballot
+	VotesNeeded     int
 	PrimaryWritable bool
-	ReplicaLag     ReplicaState
-	PeerGTID       map[string]gtid.Set
-	LocalEpoch     uint64
-	RemoteEpoch    uint64
-	ConsulUp       bool
-	Maintenance    bool
-	IsLeader       bool
-	Mode           string
-	LastFailover   time.Time
-	MinBetween     time.Duration
+	ReplicaLag      ReplicaState
+	PeerGTID        map[string]gtid.Set
+	LocalEpoch      uint64
+	RemoteEpoch     uint64
+	ConsulUp        bool
+	Maintenance     bool
+	IsLeader        bool
+	Mode            string
+	LastFailover    time.Time
+	MinBetween      time.Duration
 }
 
 // ScenarioResult is the high-level action the engine would take.

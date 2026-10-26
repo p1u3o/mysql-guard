@@ -13,14 +13,14 @@ import (
 
 // AdminAction describes hostgroup/status changes applied on promote/fence.
 type AdminAction struct {
-	PeerName      string
-	NewPrimary    string
-	OldPrimary    string
-	NewEndpoint   Endpoint
-	OldEndpoint   Endpoint
-	WriterGroup   int
-	ReaderGroup   int
-	Fence         bool
+	PeerName    string
+	NewPrimary  string
+	OldPrimary  string
+	NewEndpoint Endpoint
+	OldEndpoint Endpoint
+	WriterGroup int
+	ReaderGroup int
+	Fence       bool
 }
 
 // Client updates ProxySQL when admin mode is enabled.

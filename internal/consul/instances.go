@@ -20,6 +20,9 @@ type GuardInstance struct {
 	LoopRenewSec  float64   `json:"loop_renew_age_sec"`
 	LoopHealthSec float64   `json:"loop_health_age_sec"`
 	LoopWatchSec  float64   `json:"loop_watch_age_sec"`
+	// PrimaryView is the primary this guard probed; PrimaryOK its reachability.
+	PrimaryView string `json:"primary_view,omitempty"`
+	PrimaryOK   bool   `json:"primary_ok"`
 }
 
 func (k KeyPaths) GuardInstance(node string) string {

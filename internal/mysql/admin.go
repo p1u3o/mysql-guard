@@ -112,7 +112,7 @@ func (a *Admin) WaitExecuted(ctx context.Context, target gtid.Set, timeout time.
 // ChangeSourceAuto sets replication source with auto positioning.
 func (a *Admin) ChangeSourceAuto(ctx context.Context, host string, port int, user, password string) error {
 	q := fmt.Sprintf(
-		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1",
+		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1",
 		escapeSQL(host), port, escapeSQL(user), escapeSQL(password),
 	)
 	return a.exec(ctx, q)

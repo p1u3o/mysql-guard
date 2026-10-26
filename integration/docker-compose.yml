@@ -36,8 +36,6 @@ services:
       - --log-bin=mysql-bin
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
-      - --read-only=ON
-      - --super-read-only=ON
     ports:
       - "33062:3306"
     depends_on:
@@ -56,15 +54,19 @@ services:
       - db-b
     environment:
       CONSUL_HTTP_ADDR: consul:8500
+      MYSQL_PASSWORD: placeholder
     command:
       - --node=db-a
+      - --mysql-host=db-a
       - --role=db
-      - --mode=observe
+      - --mode=act
       - --cluster=example
       - --peers=db-a,db-b
       - --mysql-user=root
-      - --mysql-password=placeholder
       - --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --interval=2s
+      - --session-ttl=10s
+      - --lock-delay=1s
       - --http=:9471
     ports:
       - "9471:9471"
@@ -79,15 +81,19 @@ services:
       - db-b
     environment:
       CONSUL_HTTP_ADDR: consul:8500
+      MYSQL_PASSWORD: placeholder
     command:
       - --node=db-b
+      - --mysql-host=db-b
       - --role=db
-      - --mode=observe
+      - --mode=act
       - --cluster=example
       - --peers=db-a,db-b
       - --mysql-user=root
-      - --mysql-password=placeholder
       - --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --interval=2s
+      - --session-ttl=10s
+      - --lock-delay=1s
       - --http=:9472
     ports:
       - "9472:9472"
@@ -102,15 +108,18 @@ services:
       - db-b
     environment:
       CONSUL_HTTP_ADDR: consul:8500
+      MYSQL_PASSWORD: placeholder
     command:
       - --node=witness-1
       - --role=witness
-      - --mode=observe
+      - --mode=act
       - --cluster=example
       - --peers=db-a,db-b
       - --mysql-user=root
-      - --mysql-password=placeholder
       - --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306
+      - --interval=2s
+      - --session-ttl=10s
+      - --lock-delay=1s
       - --http=:9473
     ports:
       - "9473:9473"

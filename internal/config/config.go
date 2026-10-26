@@ -39,12 +39,12 @@ type Config struct {
 	Role     Role
 	Mode     Mode
 
-	MySQLDSN            string
-	MySQLHost           string
-	MySQLPort           int
-	MySQLAdminUser      string
-	MySQLAdminPass      string
-	MySQLAdminPassFile  string
+	MySQLDSN           string
+	MySQLHost          string
+	MySQLPort          int
+	MySQLAdminUser     string
+	MySQLAdminPass     string
+	MySQLAdminPassFile string
 
 	ConsulAddr      string
 	ConsulTokenFile string
@@ -55,26 +55,26 @@ type Config struct {
 
 	HTTPListen string
 
-	Interval         time.Duration
-	ProbeTimeout     time.Duration
-	SlowThreshold    int
-	DeadAfter        time.Duration
-	VotesNeeded      int
-	SessionTTL       time.Duration
-	LockDelay        time.Duration
-	MinBetweenFail   time.Duration
-	MaxApplyLag      time.Duration
-	LagGateMaxWait   time.Duration
-	FenceGrace       time.Duration
-	ReplicaStale     time.Duration
+	Interval            time.Duration
+	ProbeTimeout        time.Duration
+	SlowThreshold       int
+	DeadAfter           time.Duration
+	VotesNeeded         int
+	SessionTTL          time.Duration
+	LockDelay           time.Duration
+	MinBetweenFail      time.Duration
+	MaxApplyLag         time.Duration
+	LagGateMaxWait      time.Duration
+	FenceGrace          time.Duration
+	ReplicaStale        time.Duration
 	ProxySQLMode        ProxySQLMode
 	ProxySQLAdminDSN    string
 	ProxySQLAdminEnable bool
 	ProxySQLWriterHG    int
 	ProxySQLReaderHG    int
 
-	NtfyURL          string
-	ReplLagAlertSec  float64
+	NtfyURL           string
+	ReplLagAlertSec   float64
 	ConsulServiceID   string
 	ConsulServiceName string
 
@@ -115,28 +115,28 @@ func Load(args []string) (*Config, error) {
 	fs.SetOutput(os.Stderr)
 
 	c := &Config{
-		Mode:           ModeObserve,
-		Interval:       2 * time.Second,
-		ProbeTimeout:   3 * time.Second,
-		SlowThreshold:  4,
-		DeadAfter:      30 * time.Second,
-		VotesNeeded:    2,
-		SessionTTL:     15 * time.Second,
-		LockDelay:      15 * time.Second,
-		MinBetweenFail: time.Hour,
-		MaxApplyLag:    30 * time.Second,
-		LagGateMaxWait: 0,
-		FenceGrace:     30 * time.Second,
-		ReplicaStale:   35 * time.Second,
-		ProxySQLMode:        ProxySQLMonitor,
-		ProxySQLWriterHG:    10,
-		ProxySQLReaderHG:    11,
-		ReplLagAlertSec:     30,
-		HTTPListen:          ":9470",
-		ConsulAddr:          "127.0.0.1:8500",
-		MySQLPort:           3306,
-		ConsulServiceName:   "mysql-guard",
-		ActionLogMax:        500,
+		Mode:              ModeObserve,
+		Interval:          2 * time.Second,
+		ProbeTimeout:      3 * time.Second,
+		SlowThreshold:     4,
+		DeadAfter:         30 * time.Second,
+		VotesNeeded:       2,
+		SessionTTL:        15 * time.Second,
+		LockDelay:         15 * time.Second,
+		MinBetweenFail:    time.Hour,
+		MaxApplyLag:       30 * time.Second,
+		LagGateMaxWait:    0,
+		FenceGrace:        30 * time.Second,
+		ReplicaStale:      35 * time.Second,
+		ProxySQLMode:      ProxySQLMonitor,
+		ProxySQLWriterHG:  10,
+		ProxySQLReaderHG:  11,
+		ReplLagAlertSec:   30,
+		HTTPListen:        ":9470",
+		ConsulAddr:        "127.0.0.1:8500",
+		MySQLPort:         3306,
+		ConsulServiceName: "mysql-guard",
+		ActionLogMax:      500,
 	}
 
 	var peers string

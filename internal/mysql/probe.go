@@ -110,9 +110,12 @@ func (p *Prober) ReadGTIDState(ctx context.Context) (GTIDState, error) {
 	if err := row.Scan(&st.Executed, &st.Retrieved, &st.ReadOnly, &st.SuperReadOnly); err != nil {
 		return GTIDState{}, err
 	}
-	var slaveStatus string
-	err := p.db.QueryRowContext(ctx, "SELECT @@global.gtid_executed").Scan(&slaveStatus)
-	_ = err
+	var received sql.NullString
+	if err := p.db.QueryRowContext(ctx, "SELECT RECEIVED_TRANSACTION_SET FROM performance_schema.replication_connection_status LIMIT 1").Scan(&received); err == nil && received.Valid {
+		st.Retrieved = received.String
+	} else {
+		st.Retrieved = ""
+	}
 	// Replica thread state (MySQL 8): simplified for draft
 	var io, sql string
 	_ = p.db.QueryRowContext(ctx, "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1").Scan(&io)

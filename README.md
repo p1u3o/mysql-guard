@@ -26,7 +26,11 @@ Set `-consul-service-id` (and optionally `-consul-service-name`, default `mysql-
 
 ### Initial writer KV
 
-On a fresh cluster, the **leader** running on the **first peer** (`--peers` order) seeds `mysql/master/<cluster>` when the key is absent, the local instance is writable, and it has no replication source. A log line is emitted when seeding runs.
+On a fresh cluster, the **leader** seeds `mysql/master/<cluster>` from the observed topology: only when the key is empty, every peer is reachable, exactly one peer is writable, and no other peer has GTIDs missing from that writer. Seeding is logged to the action log (`seed_primary`).
+
+Only `db` guards compete for the leader lock (non-blocking session acquire, retried every `session-ttl/3`). `witness` guards take part in Consul coordination only and skip MySQL and replication checks.
+
+Automatic failover (mode `act`): the leader promotes the most advanced reachable replica when at least `--votes-needed` DB guards report the primary unreachable for three consecutive ticks. A non-primary peer that stays writable for two ticks is fenced (`super_read_only`).
 
 ### Web UI
 
@@ -54,7 +58,7 @@ Admin updates match `mysql_servers` rows by **hostname and port**. Map logical p
 
 | Mode | Behaviour |
 |------|-----------|
-| `observe` | Full decision loop; log and metrics only (`mysqlguard_would_act_total`) |
+| `observe` | Full decision loop; log and metrics only (`mysql_guard_would_act_total`) |
 | `fence` | Fence stray writers; no promotion |
 | `act` | Fence + promote + ProxySQL admin (when enabled) |
 
@@ -81,7 +85,7 @@ Credentials: `MYSQL_DSN`, `MYSQL_PASSWORD` / `MYSQL_PASSWORD_FILE`, `CONSUL_HTTP
 
 | Area | Status |
 |------|--------|
-| Consul leader lock + renewal goroutine | Implemented (simplified lock acquire) |
+| Consul leader lock + renewal goroutine | Implemented (non-blocking session acquire) |
 | Epoch CAS + fenced KV markers | Implemented |
 | GTID gate + peer offset election | Implemented (GTID parser is simplified) |
 | Vote streaks (V1 probe wired; V2/V3 stubbed in health loop) | Partial |

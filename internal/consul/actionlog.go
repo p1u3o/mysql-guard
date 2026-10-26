@@ -26,7 +26,7 @@ func (s *Store) GetActionLog(ctx context.Context) ([]actionlog.Entry, error) {
 func (s *Store) AppendActionLog(ctx context.Context, e actionlog.Entry, max int) error {
 	key := s.keys.ActionLog()
 	for attempt := 0; attempt < 8; attempt++ {
-		pair, meta, err := s.client.KV().Get(key, nil)
+		pair, _, err := s.client.KV().Get(key, nil)
 		if err != nil {
 			return err
 		}
@@ -44,7 +44,7 @@ func (s *Store) AppendActionLog(ctx context.Context, e actionlog.Entry, max int)
 		}
 		kv := &capi.KVPair{Key: key, Value: b}
 		if pair != nil {
-			kv.ModifyIndex = meta.LastIndex
+			kv.ModifyIndex = pair.ModifyIndex
 			ok, _, err := s.client.KV().CAS(kv, nil)
 			if err != nil {
 				return err

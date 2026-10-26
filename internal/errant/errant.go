@@ -8,9 +8,9 @@ import (
 
 // Result of comparing a node's executed set to an authoritative source.
 type Result struct {
-	Errant     bool
-	ErrantSet  gtid.Set
-	Reason     string
+	Errant    bool
+	ErrantSet gtid.Set
+	Reason    string
 }
 
 // Detect returns errant transactions on local that are not on source (gtid_subtract(local, source)).

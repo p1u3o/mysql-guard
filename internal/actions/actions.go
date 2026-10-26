@@ -18,15 +18,15 @@ import (
 
 // Executor performs fence/promote/register when mode allows.
 type Executor struct {
-	cfg      *config.Config
-	log      *slog.Logger
-	mysql    *mysql.Prober
-	peers    *mysql.Pool
-	proxy    *proxysql.Client
-	store    *consul.Store
-	alerts   *notify.Fanout
-	alog     *Logger
-	observe  bool
+	cfg       *config.Config
+	log       *slog.Logger
+	mysql     *mysql.Prober
+	peers     *mysql.Pool
+	proxy     *proxysql.Client
+	store     *consul.Store
+	alerts    *notify.Fanout
+	alog      *Logger
+	observe   bool
 	fenceOnly bool
 }
 
@@ -148,4 +148,3 @@ func (e *Executor) PublishReplicationAlerts(ctx context.Context, st replhealth.S
 		}
 	}
 }
-

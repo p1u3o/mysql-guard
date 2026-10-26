@@ -8,11 +8,11 @@ import (
 
 func TestBuildPeerDSN(t *testing.T) {
 	cfg := &config.Config{
-		NodeName: "db-a",
+		NodeName:       "db-a",
 		MySQLAdminUser: "guard",
 		MySQLAdminPass: "secret",
-		MySQLHost: "127.0.0.1",
-		MySQLPort: 3306,
+		MySQLHost:      "127.0.0.1",
+		MySQLPort:      3306,
 		MySQLPeerEndpoints: map[string]string{
 			"db-a": "10.0.0.1:3306",
 			"db-b": "10.0.0.2:3306",

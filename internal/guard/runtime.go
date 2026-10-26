@@ -2,6 +2,7 @@ package guard
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -10,7 +11,6 @@ import (
 	"mysql-guard/internal/actions"
 	"mysql-guard/internal/config"
 	"mysql-guard/internal/consul"
-	"mysql-guard/internal/decision"
 	"mysql-guard/internal/gtid"
 	"mysql-guard/internal/metrics"
 	"mysql-guard/internal/mysql"
@@ -33,14 +33,16 @@ type Runtime struct {
 	exec    *actions.Executor
 	metrics *metrics.Registry
 
-	mu          sync.RWMutex
-	lastMaint   bool
-	ballot      vote.Ballot
-	status      Status
-	epoch       uint64
-	lastFail    time.Time
-	lastHealth  time.Time
-	lastWatch   time.Time
+	mu         sync.RWMutex
+	lastMaint  bool
+	ballot     vote.Ballot
+	status     Status
+	epoch      uint64
+	lastFail   time.Time
+	lastHealth time.Time
+	lastWatch  time.Time
+	writable   map[string]int
+	deadTicks  int
 }
 
 func NewRuntime(cfg *config.Config, log *slog.Logger, store *consul.Store, lock *consul.LeaderLock, my *mysql.Prober, peers *mysql.Pool, px *proxysql.Client, exec *actions.Executor, m *metrics.Registry) *Runtime {
@@ -54,7 +56,7 @@ func NewRuntime(cfg *config.Config, log *slog.Logger, store *consul.Store, lock 
 		proxy:   px,
 		exec:    exec,
 		metrics: m,
-		status: Status{Node: cfg.NodeName, Role: string(cfg.Role), Mode: string(cfg.Mode)},
+		status:  Status{Node: cfg.NodeName, Role: string(cfg.Role), Mode: string(cfg.Mode)},
 	}
 }
 
@@ -83,24 +85,45 @@ func (r *Runtime) healthLoop(ctx context.Context) {
 	}
 }
 
-func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
-	res, elapsed := r.mysql.Ping(ctx)
-	r.metrics.ProbeSeconds.Observe(elapsed.Seconds())
-	switch res {
-	case vote.ProbeSlow:
-		r.metrics.ProbeSlowTotal.Inc()
-	case vote.ProbeFailed, vote.ProbeRefused:
-		r.metrics.ProbeFailTotal.Inc()
+// Checks lists which probes a guard role performs.
+type Checks struct {
+	MySQL       bool // local/peer MySQL probes, topology, seed and failover decisions
+	Replication bool // replication health alerts
+}
+
+// ChecksFor returns the checks a role runs. Witness guards only take part in
+// Consul coordination and never touch MySQL.
+func ChecksFor(role config.Role) Checks {
+	if role == config.RoleWitness {
+		return Checks{}
 	}
+	return Checks{MySQL: true, Replication: true}
+}
 
-	r.mu.Lock()
-	r.ballot.UpdateAll(now, res, vote.ProbeOK, vote.ProbeOK, r.cfg.SlowThreshold, r.cfg.DeadAfter)
-	dead := r.ballot.DeadCount()
-	ballot := r.ballot
-	r.mu.Unlock()
+type peerObs struct {
+	st  mysql.GTIDState
+	err error
+}
 
-	r.metrics.DeadVotes.WithLabelValues("v1").Set(boolToF(ballot.V1.Dead))
-	r.metrics.DeadVotes.WithLabelValues("total").Set(float64(dead))
+func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
+	checks := ChecksFor(r.cfg.Role)
+	var ballot vote.Ballot
+	dead := 0
+	if checks.MySQL {
+		res, elapsed := r.mysql.Ping(ctx)
+		r.metrics.ProbeSeconds.Observe(elapsed.Seconds())
+		switch res {
+		case vote.ProbeSlow:
+			r.metrics.ProbeSlowTotal.Inc()
+		case vote.ProbeFailed, vote.ProbeRefused:
+			r.metrics.ProbeFailTotal.Inc()
+		}
+		r.mu.Lock()
+		r.ballot.UpdateAll(now, res, vote.ProbeOK, vote.ProbeOK, r.cfg.SlowThreshold, r.cfg.DeadAfter)
+		ballot = r.ballot
+		r.mu.Unlock()
+		r.metrics.DeadVotes.WithLabelValues("v1").Set(boolToF(ballot.V1.Dead))
+	}
 
 	maint, maintMsg, _ := r.store.MaintenanceEnabled(ctx)
 	primary, epochKV, _ := r.store.GetPrimary(ctx)
@@ -108,52 +131,74 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 		r.logMaintenance(ctx, maint, maintMsg, epochKV)
 		r.lastMaint = maint
 	}
-	topology := r.buildTopology(ctx, primary)
 
-	replSt := replhealth.State{Node: r.cfg.NodeName, ExpectReadOnly: r.cfg.NodeName != primary}
-	if st, err := r.mysql.ReadGTIDState(ctx); err == nil {
-		replSt.ReadOnly = st.ReadOnly
-		replSt.IOThreadOn = st.IOThread
-		replSt.SQLThreadOn = st.SQLThread
-		replSt.LagSeconds = st.LagSeconds
+	var topology []NodeTopology
+	obs := map[string]peerObs{}
+	if checks.MySQL {
+		topology, obs = r.buildTopology(ctx, primary)
 	}
-	r.exec.PublishReplicationAlerts(ctx, replSt)
+	if checks.Replication {
+		replSt := replhealth.State{Node: r.cfg.NodeName, ExpectReadOnly: primary != "" && r.cfg.NodeName != primary}
+		if st, err := r.mysql.ReadGTIDState(ctx); err == nil {
+			replSt.ReadOnly = st.ReadOnly
+			replSt.IOThreadOn = st.IOThread || !replSt.ExpectReadOnly
+			replSt.SQLThreadOn = st.SQLThread || !replSt.ExpectReadOnly
+			replSt.LagSeconds = st.LagSeconds
+			r.exec.PublishReplicationAlerts(ctx, replSt)
+		}
+	}
 
-	if r.lock.IsLeader() {
-		_ = MaybeSeedMaster(ctx, r.log, r.store, r.mysql, r.cfg.NodeName, r.cfg.Peers, true)
+	primaryOK := false
+	if checks.MySQL && primary != "" {
+		primaryOK = obs[primary].err == nil
 	}
-	if r.lock.IsLeader() && r.lock.VerifyLeaderBeforeAction(r.cfg.SessionTTL) {
-		r.decide(ctx, now, dead, ballot, maint, epochKV, topology)
+
+	if checks.MySQL && r.lock.VerifyLeaderBeforeAction(r.cfg.SessionTTL) {
+		if primary == "" {
+			in := SeedInput{IsLeader: true}
+			for _, p := range r.cfg.Peers {
+				o := obs[p]
+				in.Nodes = append(in.Nodes, SeedNode{Node: p, Reachable: o.err == nil, Writable: o.err == nil && !o.st.ReadOnly, Executed: gtid.Parse(o.st.Executed)})
+			}
+			if node, err := maybeSeedMaster(ctx, r.log, r.store, r.cfg.NodeName, in, r.cfg.ActionLogMax); err != nil {
+				r.log.Warn("seed writer key", "err", err)
+			} else if node != "" {
+				primary, epochKV, _ = r.store.GetPrimary(ctx)
+				primaryOK = obs[primary].err == nil
+			}
+		} else {
+			dead = r.decide(ctx, now, maint, primary, epochKV, obs)
+		}
 	}
+	r.metrics.DeadVotes.WithLabelValues("total").Set(float64(dead))
 	r.lastHealth = now
-	r.refreshStatus(ctx, now, dead, maint, maintMsg, primary, epochKV, topology)
+	r.refreshStatus(ctx, now, dead, maint, maintMsg, primary, epochKV, topology, primaryOK)
 }
 
-func (r *Runtime) buildTopology(ctx context.Context, primary string) []NodeTopology {
+func (r *Runtime) buildTopology(ctx context.Context, primary string) ([]NodeTopology, map[string]peerObs) {
 	var nodes []NodeTopology
+	obs := map[string]peerObs{}
 	for _, p := range r.cfg.Peers {
 		nt := NodeTopology{Node: p}
-		if rec, err := r.store.GetGTID(ctx, p); err == nil && rec != nil {
-			nt.Executed = rec.Executed
-			nt.Retrieved = rec.Retrieved
-		}
 		var st mysql.GTIDState
 		var err error
 		if r.peers != nil {
 			st, err = r.peers.ReadState(ctx, p)
 		} else if p == r.cfg.NodeName {
 			st, err = r.mysql.ReadGTIDState(ctx)
+		} else {
+			err = errNoPeerPool
 		}
+		obs[p] = peerObs{st: st, err: err}
 		if err == nil {
-			if st.Executed != "" {
-				nt.Executed = st.Executed
-				nt.Retrieved = st.Retrieved
-				nt.ReadOnly = st.ReadOnly
-				nt.SuperReadOnly = st.SuperReadOnly
-				nt.IOThread = st.IOThread
-				nt.SQLThread = st.SQLThread
-				nt.LagSec = st.LagSeconds
-			}
+			nt.Reachable = true
+			nt.Executed = st.Executed
+			nt.Retrieved = st.Retrieved
+			nt.ReadOnly = st.ReadOnly
+			nt.SuperReadOnly = st.SuperReadOnly
+			nt.IOThread = st.IOThread
+			nt.SQLThread = st.SQLThread
+			nt.LagSec = st.LagSeconds
 		}
 		if p == primary {
 			nt.ProxySQLStatus = "writer"
@@ -162,11 +207,12 @@ func (r *Runtime) buildTopology(ctx context.Context, primary string) []NodeTopol
 			nt.ProxySQLStatus = "replica"
 			nt.ProxySQLHG = r.cfg.ProxySQLReaderHG
 		}
-		nt.ReadOnly = nt.ReadOnly || p != primary
 		nodes = append(nodes, nt)
 	}
-	return nodes
+	return nodes, obs
 }
+
+var errNoPeerPool = errors.New("peer pool not configured")
 
 func boolToF(v bool) float64 {
 	if v {
@@ -175,65 +221,125 @@ func boolToF(v bool) float64 {
 	return 0
 }
 
-func (r *Runtime) decide(ctx context.Context, now time.Time, dead int, ballot vote.Ballot, maint bool, epochKV uint64, topology []NodeTopology) {
-	r.mu.RLock()
-	epoch := r.epoch
-	lastFail := r.lastFail
-	r.mu.RUnlock()
-
-	primary, _, _ := r.store.GetPrimary(ctx)
-	replica := decision.ReplicaState{Node: r.cfg.NodeName, ReadOnly: true, IOThreadRunning: true, SQLThreadKnown: true}
-	local := gtid.Set("")
-	primaryExecuted := gtid.Set("")
-	if st, err := r.mysql.ReadGTIDState(ctx); err == nil {
-		replica.ReadOnly = st.ReadOnly
-		replica.IOThreadRunning = st.IOThread
-		replica.SQLThreadKnown = st.SQLThread
-		replica.Executed = gtid.Parse(st.Executed)
-		replica.Retrieved = gtid.Parse(st.Retrieved)
-		local = replica.Executed
+// CountDeadVotes counts DB guards that currently see primary as unreachable.
+// Only fresh reports about the same primary count; witnesses do not vote.
+func CountDeadVotes(self string, selfPrimaryOK bool, primary string, guards []consul.GuardInstance, now time.Time, maxAge time.Duration) int {
+	votes := 0
+	if !selfPrimaryOK {
+		votes++
 	}
-	peerGTID := map[string]gtid.Set{}
-	for _, nt := range topology {
-		peerGTID[nt.Node] = gtid.Parse(nt.Executed)
-		if nt.Node == primary {
-			primaryExecuted = gtid.Parse(nt.Executed)
+	for _, g := range guards {
+		if g.Node == self || g.Role != string(config.RoleDB) {
+			continue
+		}
+		if g.PrimaryView != primary || now.Sub(g.LastHeartbeat) > maxAge {
+			continue
+		}
+		if !g.PrimaryOK {
+			votes++
 		}
 	}
+	return votes
+}
 
-	in := decision.ScenarioInput{
-		Now:          now,
-		Ballot:       ballot,
-		VotesNeeded:  r.cfg.VotesNeeded,
-		ConsulUp:     true,
-		Maintenance:  maint,
-		IsLeader:     true,
-		ReplicaLag:   replica,
-		PeerGTID:     peerGTID,
-		LocalEpoch:   epoch,
-		RemoteEpoch:  epochKV,
-		LastFailover: lastFail,
-		MinBetween:   r.cfg.MinBetweenFail,
+// decide runs leader-only fence and failover logic; returns dead vote count.
+func (r *Runtime) decide(ctx context.Context, now time.Time, maint bool, primary string, epoch uint64, obs map[string]peerObs) int {
+	guards, _ := r.store.ListGuardInstances(ctx)
+	dead := CountDeadVotes(r.cfg.NodeName, obs[primary].err == nil, primary, guards, now, 3*r.cfg.Interval+time.Second)
+	if maint {
+		r.setDecision("none: maintenance mode")
+		return dead
 	}
-	if !replica.ReadOnly {
-		in.PrimaryWritable = true
+
+	// Fence any non-primary peer that stays writable across two ticks
+	// (a planned switchover flips roles within a single tick).
+	r.mu.Lock()
+	if r.writable == nil {
+		r.writable = map[string]int{}
 	}
-	sc := decision.EvaluateScenario(in)
-	if r.cfg.Mode == config.ModeObserve && sc.Action != "none" {
-		r.metrics.WouldActTotal.Inc()
+	var toFence []string
+	for _, p := range r.cfg.Peers {
+		o := obs[p]
+		if p != primary && o.err == nil && !o.st.ReadOnly {
+			r.writable[p]++
+			if r.writable[p] >= 2 {
+				toFence = append(toFence, p)
+			}
+		} else {
+			r.writable[p] = 0
+		}
 	}
-	oldPrimary := primary
-	if oldPrimary == "" {
-		oldPrimary = r.cfg.Peers[0]
+	r.mu.Unlock()
+	for _, p := range toFence {
+		if err := r.exec.FenceNode(ctx, p, epoch, "writable non-primary "+p+" (primary is "+primary+")"); err != nil {
+			r.log.Error("fence failed", "node", p, "err", err)
+		} else if r.cfg.Mode != config.ModeObserve {
+			r.metrics.FencesTotal.Inc()
+		}
+		r.setDecision("fence: " + p)
 	}
-	r.exec.RunScenario(ctx, sc, r.cfg.NodeName, oldPrimary, local, primaryExecuted, epochKV)
 
 	r.mu.Lock()
-	r.status.LastDecision = sc.Action + ": " + sc.Reason
+	if dead >= r.cfg.VotesNeeded {
+		r.deadTicks++
+	} else {
+		r.deadTicks = 0
+	}
+	deadTicks := r.deadTicks
+	lastFail := r.lastFail
+	r.mu.Unlock()
+	if deadTicks < 3 {
+		if len(toFence) == 0 {
+			r.setDecision("none: primary " + primary + " healthy")
+		}
+		return dead
+	}
+	if !lastFail.IsZero() && now.Sub(lastFail) < r.cfg.MinBetweenFail {
+		r.setDecision("none: failover rate limited")
+		return dead
+	}
+	cands := map[string]gtid.Set{}
+	for _, p := range r.cfg.Peers {
+		if o := obs[p]; p != primary && o.err == nil {
+			cands[p] = gtid.Parse(o.st.Executed)
+		}
+	}
+	if len(cands) == 0 {
+		r.setDecision("alert: primary dead, no reachable candidate")
+		return dead
+	}
+	cand, ok := gtid.ComparePeers(cands)
+	if !ok || cand == "" {
+		for c := range cands {
+			cand = c
+		}
+	}
+	if r.cfg.Mode == config.ModeObserve {
+		r.metrics.WouldActTotal.Inc()
+	}
+	if err := r.exec.Failover(ctx, primary, cand, epoch); err != nil {
+		r.log.Error("failover failed", "err", err)
+		r.setDecision("failover failed: " + err.Error())
+		return dead
+	}
+	if r.cfg.Mode == config.ModeAct {
+		r.metrics.FailoversTotal.Inc()
+	}
+	r.mu.Lock()
+	r.lastFail = now
+	r.deadTicks = 0
+	r.mu.Unlock()
+	r.setDecision("failover: " + primary + " -> " + cand)
+	return dead
+}
+
+func (r *Runtime) setDecision(d string) {
+	r.mu.Lock()
+	r.status.LastDecision = d
 	r.mu.Unlock()
 }
 
-func (r *Runtime) refreshStatus(ctx context.Context, now time.Time, dead int, maint bool, maintMsg, primary string, epoch uint64, nodes []NodeTopology) {
+func (r *Runtime) refreshStatus(ctx context.Context, now time.Time, dead int, maint bool, maintMsg, primary string, epoch uint64, nodes []NodeTopology, primaryOK bool) {
 	leader := r.lock.IsLeader()
 	renewAge := time.Since(r.lock.LastRenew()).Seconds()
 	r.metrics.Leader.Set(boolToF(leader))
@@ -253,6 +359,7 @@ func (r *Runtime) refreshStatus(ctx context.Context, now time.Time, dead int, ma
 		Node: r.cfg.NodeName, Role: string(r.cfg.Role), Mode: string(r.cfg.Mode),
 		Leader: leader, LastHeartbeat: now,
 		LoopRenewSec: renewAge, LoopHealthSec: healthAge, LoopWatchSec: watchAge,
+		PrimaryView: primary, PrimaryOK: primaryOK,
 	}
 	_ = r.store.PutGuardInstance(ctx, inst)
 

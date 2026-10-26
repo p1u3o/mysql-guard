@@ -89,6 +89,10 @@ E0=$(kv_epoch); [ "$E0" -ge 1 ] || fail "epoch after seed is $E0"
 [ "$(status 9473 | jq -r '.leader')" = false ] || fail "witness became leader"
 sleep 6; one_leader || fail "leadership not stable"
 snap 01-leader
+repl_state_on() { status "$1" | jq -e --arg n "$2" --arg s "$3" '[.nodes[] | select(.node==$n and .repl_state==$s)] | length == 1' >/dev/null; }
+wait_for 30 "db-b reported running on all DB guards" sh -c "$(declare -f status repl_state_on); repl_state_on 9471 db-b running && repl_state_on 9472 db-b running"
+[ "$(status 9471 | jq '[.nodes[] | select(has("proxysql_status"))] | length')" = 0 ] || fail "proxysql_status shown without ProxySQL"
+[ "$(status 9473 | jq '.loops.renew_age_sec < 30')" = true ] || fail "witness renew age $(status 9473 | jq .loops.renew_age_sec)"
 pass "drill 1: one leader ($(for p in "${GUARDS[@]}"; do echo -n "$p=$(status $p | jq -r .leader) "; done)), primary=db-a, epoch=$E0"
 
 check_roles() { # <primary> <replica>
@@ -168,6 +172,29 @@ wait_for 30 "GTIDs match" gtids_match
 check_roles db-b db-a
 snap 06-rejoin
 pass "drill 6: rejoin ok, gtid=$(gtid db-a)"
+
+log "=== Drill 7: guard user without performance_schema grant -> replication state unknown ==="
+sqlq db-b "SELECT 1" >/dev/null || fail "db-b down"
+sqlq db-b "CREATE USER IF NOT EXISTS 'nops'@'%' IDENTIFIED BY 'placeholder'; GRANT SUPER, REPLICATION_SLAVE_ADMIN, REPLICATION CLIENT, PROCESS, SYSTEM_VARIABLES_ADMIN, RELOAD ON *.* TO 'nops'@'%'" || fail "create nops user on primary db-b"
+wait_for 30 "nops user on db-a" sh -c "[ \"\$(docker compose exec -T db-a mysql -uroot -pplaceholder -N -B -e \"SELECT COUNT(*) FROM mysql.user WHERE user='nops'\" 2>/dev/null)\" = 1 ]"
+RO_A=$(ro db-a); RO_B=$(ro db-b); GT7=$(gtid db-b)
+docker compose run -d --rm --no-deps --name "${COMPOSE_PROJECT_NAME:-integration}-nops" -p 9474:9474 -e MYSQL_PASSWORD=placeholder guard-a \
+  --node=db-a --mysql-host=db-a --role=db --mode=observe --cluster=nops --peers=db-a,db-b --mysql-user=nops \
+  --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306 --interval=2s --session-ttl=10s --lock-delay=1s --http=:9474 >/dev/null || fail "start nops guard"
+wait_for 60 "nops guard reports db-a (replica) unknown" sh -c "curl -sf -m5 http://127.0.0.1:9474/status | jq -e '[.nodes[] | select(.node==\"db-a\" and .repl_state==\"unknown\" and .io_thread==null and .sql_thread==null and (.repl_error|test(\"denied\")))] | length == 1'"
+sleep 8
+NL=$(docker logs "${COMPOSE_PROJECT_NAME:-integration}-nops" 2>&1)
+echo "$NL" | grep -q '"code":"repl_state_unknown"' || fail "nops guard did not log repl_state_unknown"
+echo "$NL" | grep -qE 'repl_(io|sql)_stopped' && fail "nops guard reported stopped on a permission error"
+[ "$(echo "$NL" | grep -c '"code":"repl_state_unknown"')" = 1 ] || fail "repl_state_unknown logged more than once (spam)"
+[ "$(curl -sf -m5 http://127.0.0.1:9474/api/actions | jq '[.entries[]? | select(.action!="seed_primary")] | length')" = 0 ] || fail "nops guard took actions"
+[ "$(ro db-a)" = "$RO_A" ] && [ "$(ro db-b)" = "$RO_B" ] || fail "read_only changed during nops drill"
+curl -sf -m5 http://127.0.0.1:9474/status > "$SNAPDIR/07-nops-status.json" || true
+docker rm -f "${COMPOSE_PROJECT_NAME:-integration}-nops" >/dev/null
+sqlq db-b "DROP USER 'nops'@'%'" || fail "drop nops"
+primary_is db-b || fail "primary moved during nops drill"
+wait_for 30 "GTIDs match after nops drill" gtids_match
+pass "drill 7: no performance_schema grant -> db-a repl_state=unknown, no stopped alert, logged once, no actions, read_only unchanged ($RO_A/$RO_B)"
 
 SK=$(count_skipped)
 [ "$SK" = 0 ] || fail "$SK action log entries with result=skipped"

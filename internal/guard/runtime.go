@@ -141,6 +141,8 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 		replSt := replhealth.State{Node: r.cfg.NodeName, ExpectReadOnly: primary != "" && r.cfg.NodeName != primary}
 		if st, err := r.mysql.ReadGTIDState(ctx); err == nil {
 			replSt.ReadOnly = st.ReadOnly
+			replSt.Unknown = !st.ReplKnown
+			replSt.UnknownErr = st.ReplErr
 			replSt.IOThreadOn = st.IOThread || !replSt.ExpectReadOnly
 			replSt.SQLThreadOn = st.SQLThread || !replSt.ExpectReadOnly
 			replSt.LagSeconds = st.LagSeconds
@@ -196,16 +198,24 @@ func (r *Runtime) buildTopology(ctx context.Context, primary string) ([]NodeTopo
 			nt.Retrieved = st.Retrieved
 			nt.ReadOnly = st.ReadOnly
 			nt.SuperReadOnly = st.SuperReadOnly
-			nt.IOThread = st.IOThread
-			nt.SQLThread = st.SQLThread
 			nt.LagSec = st.LagSeconds
-		}
-		if p == primary {
-			nt.ProxySQLStatus = "writer"
-			nt.ProxySQLHG = r.cfg.ProxySQLWriterHG
+			nt.ReplState = st.ReplState()
+			nt.ReplError = st.ReplErr
+			if st.ReplKnown {
+				io, sqlOn := st.IOThread, st.SQLThread
+				nt.IOThread, nt.SQLThread = &io, &sqlOn
+			}
 		} else {
-			nt.ProxySQLStatus = "replica"
-			nt.ProxySQLHG = r.cfg.ProxySQLReaderHG
+			nt.ReplState = "unknown"
+		}
+		if r.proxySQLConfigured() {
+			if p == primary {
+				nt.ProxySQLStatus = "writer"
+				nt.ProxySQLHG = r.cfg.ProxySQLWriterHG
+			} else {
+				nt.ProxySQLStatus = "replica"
+				nt.ProxySQLHG = r.cfg.ProxySQLReaderHG
+			}
 		}
 		nodes = append(nodes, nt)
 	}
@@ -213,6 +223,18 @@ func (r *Runtime) buildTopology(ctx context.Context, primary string) ([]NodeTopo
 }
 
 var errNoPeerPool = errors.New("peer pool not configured")
+
+// proxySQLConfigured reports whether a ProxySQL admin connection is configured;
+// without one, ProxySQL roles are not shown in /status.
+func (r *Runtime) proxySQLConfigured() bool {
+	return r.proxy != nil && r.proxy.Enabled()
+}
+
+// candidateUsable: a failover candidate must be reachable and have a known
+// replication state; unknown state is never acted on.
+func candidateUsable(o peerObs) bool {
+	return o.err == nil && o.st.ReplKnown
+}
 
 func boolToF(v bool) float64 {
 	if v {
@@ -300,12 +322,12 @@ func (r *Runtime) decide(ctx context.Context, now time.Time, maint bool, primary
 	}
 	cands := map[string]gtid.Set{}
 	for _, p := range r.cfg.Peers {
-		if o := obs[p]; p != primary && o.err == nil {
+		if o := obs[p]; p != primary && candidateUsable(o) {
 			cands[p] = gtid.Parse(o.st.Executed)
 		}
 	}
 	if len(cands) == 0 {
-		r.setDecision("alert: primary dead, no reachable candidate")
+		r.setDecision("alert: primary dead, no reachable candidate with known replication state")
 		return dead
 	}
 	cand, ok := gtid.ComparePeers(cands)
@@ -340,6 +362,10 @@ func (r *Runtime) setDecision(d string) {
 }
 
 func (r *Runtime) refreshStatus(ctx context.Context, now time.Time, dead int, maint bool, maintMsg, primary string, epoch uint64, nodes []NodeTopology, primaryOK bool) {
+	if r.cfg.Role == config.RoleWitness {
+		// Witnesses hold no session; their liveness is this loop publishing the heartbeat.
+		r.lock.MarkAlive(now)
+	}
 	leader := r.lock.IsLeader()
 	renewAge := time.Since(r.lock.LastRenew()).Seconds()
 	r.metrics.Leader.Set(boolToF(leader))

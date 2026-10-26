@@ -13,6 +13,10 @@ type State struct {
 	ReadOnly       bool
 	ExpectReadOnly bool
 	LagSeconds     float64
+	// Unknown is set when the replication state could not be read (UnknownErr
+	// holds why). Unknown never produces stopped alerts.
+	Unknown    bool
+	UnknownErr string
 }
 
 // Alert is a replication hygiene issue.
@@ -30,13 +34,16 @@ type Config struct {
 // Evaluate returns alerts for IO/SQL stopped, lag, and read_only drift.
 func Evaluate(st State, cfg Config) []Alert {
 	var out []Alert
-	if !st.IOThreadOn {
+	if st.Unknown {
+		out = append(out, Alert{Severity: "warning", Code: "repl_state_unknown", Message: fmt.Sprintf("%s: replication state unknown: %s", st.Node, st.UnknownErr)})
+	}
+	if !st.Unknown && !st.IOThreadOn {
 		out = append(out, Alert{Severity: "critical", Code: "repl_io_stopped", Message: fmt.Sprintf("%s: IO thread not running", st.Node)})
 	}
-	if !st.SQLThreadOn {
+	if !st.Unknown && !st.SQLThreadOn {
 		out = append(out, Alert{Severity: "critical", Code: "repl_sql_stopped", Message: fmt.Sprintf("%s: SQL thread not running", st.Node)})
 	}
-	if cfg.MaxLagSeconds > 0 && st.LagSeconds > cfg.MaxLagSeconds {
+	if !st.Unknown && cfg.MaxLagSeconds > 0 && st.LagSeconds > cfg.MaxLagSeconds {
 		out = append(out, Alert{Severity: "warning", Code: "repl_lag", Message: fmt.Sprintf("%s: lag %.1fs over %.1fs", st.Node, st.LagSeconds, cfg.MaxLagSeconds)})
 	}
 	if st.ExpectReadOnly && !st.ReadOnly {

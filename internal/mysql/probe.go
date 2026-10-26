@@ -88,6 +88,12 @@ func isRefused(err error) bool {
 }
 
 // GTIDState reads executed and retrieved sets from the local instance.
+//
+// Replication thread fields are only meaningful when ReplKnown is true. When a
+// replication query fails (for example the guard user cannot read
+// performance_schema), ReplKnown is false and ReplErr carries the error: callers
+// must treat the replication state as unknown, never as stopped, and must not
+// act on it.
 type GTIDState struct {
 	Executed             string
 	Retrieved            string
@@ -97,8 +103,94 @@ type GTIDState struct {
 	SQLThread            bool
 	LagSeconds           float64
 	HasReplicationSource bool
+	ReplKnown            bool
+	ReplErr              string
 }
 
+// ReplState summarises replication for display: running, stopped, partial,
+// none (no replication source configured) or unknown.
+func (s GTIDState) ReplState() string {
+	switch {
+	case !s.ReplKnown:
+		return "unknown"
+	case !s.HasReplicationSource:
+		return "none"
+	case s.IOThread && s.SQLThread:
+		return "running"
+	case !s.IOThread && !s.SQLThread:
+		return "stopped"
+	default:
+		return "partial"
+	}
+}
+
+// rowQuerier is the subset of *sql.DB used by the replication probe (tests stub it).
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+const (
+	qReceived = "SELECT RECEIVED_TRANSACTION_SET FROM performance_schema.replication_connection_status LIMIT 1"
+	qIOState  = "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1"
+	qSQLState = "SELECT SERVICE_STATE FROM performance_schema.replication_applier_status LIMIT 1"
+)
+
+// scanString runs a single-column query. A missing row is not an error (no
+// replication channel); any other error is returned.
+type stringScanner func(ctx context.Context, q string) (val string, valid bool, found bool, err error)
+
+func dbScanner(db rowQuerier) stringScanner {
+	return func(ctx context.Context, q string) (string, bool, bool, error) {
+		var v sql.NullString
+		err := db.QueryRowContext(ctx, q).Scan(&v)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, false, nil
+		}
+		if err != nil {
+			return "", false, false, err
+		}
+		return v.String, v.Valid, true, nil
+	}
+}
+
+// readReplication fills the replication fields of st. It never turns an error
+// into "stopped": on any query error ReplKnown stays false and ReplErr is set.
+func readReplication(ctx context.Context, scan stringScanner, st *GTIDState) {
+	fail := func(what string, err error) {
+		st.ReplKnown = false
+		st.IOThread, st.SQLThread, st.HasReplicationSource = false, false, false
+		st.Retrieved = ""
+		st.ReplErr = what + ": " + err.Error()
+	}
+	recv, recvValid, _, err := scan(ctx, qReceived)
+	if err != nil {
+		fail("replication_connection_status", err)
+		return
+	}
+	io, _, ioFound, err := scan(ctx, qIOState)
+	if err != nil {
+		fail("replication_connection_status", err)
+		return
+	}
+	sqlState, _, _, err := scan(ctx, qSQLState)
+	if err != nil {
+		fail("replication_applier_status", err)
+		return
+	}
+	st.ReplKnown = true
+	st.ReplErr = ""
+	if recvValid {
+		st.Retrieved = recv
+	} else {
+		st.Retrieved = ""
+	}
+	st.HasReplicationSource = ioFound
+	st.IOThread = strings.EqualFold(io, "ON")
+	st.SQLThread = strings.EqualFold(sqlState, "ON")
+}
+
+// ReadGTIDState returns an error only when the base variables cannot be read
+// (node unreachable). Replication query errors are surfaced via ReplKnown/ReplErr.
 func (p *Prober) ReadGTIDState(ctx context.Context) (GTIDState, error) {
 	if p.db == nil {
 		return GTIDState{}, errors.New("no mysql connection")
@@ -106,25 +198,11 @@ func (p *Prober) ReadGTIDState(ctx context.Context) (GTIDState, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.Timeout)
 	defer cancel()
 	var st GTIDState
-	row := p.db.QueryRowContext(ctx, "SELECT @@global.gtid_executed, @@global.gtid_executed, @@global.read_only, @@global.super_read_only")
-	if err := row.Scan(&st.Executed, &st.Retrieved, &st.ReadOnly, &st.SuperReadOnly); err != nil {
+	row := p.db.QueryRowContext(ctx, "SELECT @@global.gtid_executed, @@global.read_only, @@global.super_read_only")
+	if err := row.Scan(&st.Executed, &st.ReadOnly, &st.SuperReadOnly); err != nil {
 		return GTIDState{}, err
 	}
-	var received sql.NullString
-	if err := p.db.QueryRowContext(ctx, "SELECT RECEIVED_TRANSACTION_SET FROM performance_schema.replication_connection_status LIMIT 1").Scan(&received); err == nil && received.Valid {
-		st.Retrieved = received.String
-	} else {
-		st.Retrieved = ""
-	}
-	// Replica thread state (MySQL 8): simplified for draft
-	var io, sql string
-	_ = p.db.QueryRowContext(ctx, "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status LIMIT 1").Scan(&io)
-	_ = p.db.QueryRowContext(ctx, "SELECT SERVICE_STATE FROM performance_schema.replication_applier_status_by_worker LIMIT 1").Scan(&sql)
-	st.IOThread = strings.EqualFold(io, "ON")
-	st.SQLThread = sql != ""
-	var srcCount int
-	_ = p.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM performance_schema.replication_connection_status WHERE SERVICE_STATE IS NOT NULL").Scan(&srcCount)
-	st.HasReplicationSource = srcCount > 0
+	readReplication(ctx, dbScanner(p.db), &st)
 	return st, nil
 }
 

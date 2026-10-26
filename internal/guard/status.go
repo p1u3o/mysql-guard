@@ -15,8 +15,10 @@ type NodeTopology struct {
 	LagSec         float64 `json:"lag_seconds"`
 	ReadOnly       bool    `json:"read_only"`
 	SuperReadOnly  bool    `json:"super_read_only"`
-	IOThread       bool    `json:"io_thread"`
-	SQLThread      bool    `json:"sql_thread"`
+	ReplState      string  `json:"repl_state"`
+	ReplError      string  `json:"repl_error,omitempty"`
+	IOThread       *bool   `json:"io_thread"` // null when replication state is unknown
+	SQLThread      *bool   `json:"sql_thread"`
 	ProxySQLStatus string  `json:"proxysql_status,omitempty"`
 	ProxySQLHG     int     `json:"proxysql_hostgroup,omitempty"`
 }

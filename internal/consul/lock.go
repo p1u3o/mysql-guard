@@ -199,6 +199,14 @@ func (l *LeaderLock) set(leader bool, sess string, renewed bool) {
 	l.mu.Unlock()
 }
 
+// MarkAlive records liveness for guards that never hold a session (witness).
+// It does not grant leadership.
+func (l *LeaderLock) MarkAlive(t time.Time) {
+	l.mu.Lock()
+	l.lastRenew = t
+	l.mu.Unlock()
+}
+
 // VerifyLeaderBeforeAction re-checks leadership freshness before mutating state.
 func (l *LeaderLock) VerifyLeaderBeforeAction(maxStale time.Duration) bool {
 	if !l.IsLeader() {

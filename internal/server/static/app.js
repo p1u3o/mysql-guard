@@ -33,7 +33,7 @@
       '<div class="card"><h3>Maintenance</h3><p>' + maint + '</p></div></div>';
     const rows = (st.nodes || []).map(function (n) {
       return '<tr><td>' + esc(n.node) + '</td><td><code>' + esc((n.gtid_executed || '').slice(0, 48)) + '</code></td><td>' +
-        esc(n.lag_seconds) + '</td><td>' + (n.io_thread ? 'IO✓' : 'IO✗') + ' ' + (n.sql_thread ? 'SQL✓' : 'SQL✗') + '</td><td>' +
+        esc(n.lag_seconds) + '</td><td>' + (n.repl_state === 'unknown' ? 'repl ?' : (n.io_thread ? 'IO✓' : 'IO✗') + ' ' + (n.sql_thread ? 'SQL✓' : 'SQL✗')) + '</td><td>' +
         (n.read_only ? 'RO' : 'RW') + (n.super_read_only ? '+SRO' : '') + '</td><td>' +
         esc(n.proxysql_status || '-') + ' HG' + esc(n.proxysql_hostgroup || '') + '</td></tr>';
     }).join('');

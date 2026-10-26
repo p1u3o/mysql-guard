@@ -64,6 +64,11 @@ func (e *Executor) Failover(ctx context.Context, oldPrimary, candidate string, e
 		e.actionLog(ctx, epoch, "failover", err.Error(), "error", "read_candidate")
 		return err
 	}
+	if !st.ReplKnown {
+		err := fmt.Errorf("candidate %s replication state unknown: %s", candidate, st.ReplErr)
+		e.actionLog(ctx, epoch, "failover", err.Error(), "blocked", "repl_unknown")
+		return err
+	}
 	if err := adm.WaitExecuted(ctx, gtid.Parse(st.Retrieved), e.cfg.MaxApplyLag); err != nil {
 		e.actionLog(ctx, epoch, "failover", err.Error(), "blocked", "gtid_gate")
 		return err

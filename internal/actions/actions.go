@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
+	"sync"
 
 	"mysql-guard/internal/config"
 	"mysql-guard/internal/consul"
@@ -28,6 +30,10 @@ type Executor struct {
 	alog      *Logger
 	observe   bool
 	fenceOnly bool
+
+	replMu      sync.Mutex
+	replInit    bool
+	lastReplKey string
 }
 
 func NewExecutor(cfg *config.Config, log *slog.Logger, my *mysql.Prober, peers *mysql.Pool, px *proxysql.Client, store *consul.Store, alerts *notify.Fanout) *Executor {
@@ -141,10 +147,33 @@ func (e *Executor) RunScenario(ctx context.Context, res decision.ScenarioResult,
 
 func (e *Executor) PublishReplicationAlerts(ctx context.Context, st replhealth.State) {
 	alerts := replhealth.Evaluate(st, replhealth.Config{MaxLagSeconds: e.cfg.ReplLagAlertSec})
+	if !e.replAlertsChanged(alerts) {
+		return
+	}
+	if len(alerts) == 0 {
+		e.log.Info("replication", "code", "ok", "msg", st.Node+": replication alerts cleared")
+	}
 	for _, a := range alerts {
 		e.log.Warn("replication", "code", a.Code, "msg", a.Message)
 		if e.alerts != nil {
 			_ = e.alerts.Alert(ctx, a.Code, a.Message, a.Severity == "critical")
 		}
 	}
+}
+
+// replAlertsChanged reports whether the set of alert codes differs from the last
+// tick, so a persistent condition is logged and alerted once, not every tick.
+func (e *Executor) replAlertsChanged(alerts []replhealth.Alert) bool {
+	codes := make([]string, 0, len(alerts))
+	for _, a := range alerts {
+		codes = append(codes, a.Code)
+	}
+	key := strings.Join(codes, ",")
+	e.replMu.Lock()
+	defer e.replMu.Unlock()
+	if e.replInit && key == e.lastReplKey {
+		return false
+	}
+	e.replInit, e.lastReplKey = true, key
+	return true
 }

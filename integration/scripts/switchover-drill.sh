@@ -186,7 +186,8 @@ sleep 8
 NL=$(docker logs "${COMPOSE_PROJECT_NAME:-integration}-nops" 2>&1)
 echo "$NL" | grep -q '"code":"repl_state_unknown"' || fail "nops guard did not log repl_state_unknown"
 echo "$NL" | grep -qE 'repl_(io|sql)_stopped' && fail "nops guard reported stopped on a permission error"
-[ "$(echo "$NL" | grep -c '"code":"repl_state_unknown"')" = 1 ] || fail "repl_state_unknown logged more than once (spam)"
+# logged only when the alert set changes (seeding may change it once), never per 2s tick
+[ "$(echo "$NL" | grep -c '"code":"repl_state_unknown"')" -le 2 ] || fail "repl_state_unknown repeated per tick (spam)"
 [ "$(curl -sf -m5 http://127.0.0.1:9474/api/actions | jq '[.entries[]? | select(.action!="seed_primary")] | length')" = 0 ] || fail "nops guard took actions"
 [ "$(ro db-a)" = "$RO_A" ] && [ "$(ro db-b)" = "$RO_B" ] || fail "read_only changed during nops drill"
 curl -sf -m5 http://127.0.0.1:9474/status > "$SNAPDIR/07-nops-status.json" || true

@@ -109,6 +109,55 @@ func (a *Admin) WaitExecuted(ctx context.Context, target gtid.Set, timeout time.
 	return fmt.Errorf("timeout waiting for executed GTID set")
 }
 
+// ReplicaThreads returns the IO (connection) and SQL (applier) service states
+// and the last IO error from performance_schema.
+func (a *Admin) ReplicaThreads(ctx context.Context) (io, sqlState, ioErr string, err error) {
+	var i, e sql.NullString
+	if err = a.db.QueryRowContext(ctx, "SELECT SERVICE_STATE, LAST_ERROR_MESSAGE FROM performance_schema.replication_connection_status LIMIT 1").Scan(&i, &e); err != nil {
+		return "", "", "", err
+	}
+	var s sql.NullString
+	if err = a.db.QueryRowContext(ctx, "SELECT SERVICE_STATE FROM performance_schema.replication_applier_status LIMIT 1").Scan(&s); err != nil {
+		return "", "", "", err
+	}
+	return i.String, s.String, e.String, nil
+}
+
+// WaitReplicaConnected polls until both replication threads are ON. On timeout
+// it returns an error carrying the last observed states and IO error.
+func (a *Admin) WaitReplicaConnected(ctx context.Context, timeout time.Duration) error {
+	return waitThreads(ctx, a.ReplicaThreads, timeout, 500*time.Millisecond)
+}
+
+type threadReader func(ctx context.Context) (io, sqlState, ioErr string, err error)
+
+func waitThreads(ctx context.Context, read threadReader, timeout, every time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	last := "no reading"
+	for {
+		io, st, ioErr, err := read(ctx)
+		if err == nil && io == "ON" && st == "ON" {
+			return nil
+		}
+		if err != nil {
+			last = err.Error()
+		} else {
+			last = fmt.Sprintf("io=%s sql=%s", io, st)
+			if ioErr != "" {
+				last += " io_error=" + ioErr
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("replica not connected after %s: %s", timeout, last)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(every):
+		}
+	}
+}
+
 // ChangeSourceAuto sets replication source with auto positioning.
 func (a *Admin) ChangeSourceAuto(ctx context.Context, host string, port int, user, password string) error {
 	q := fmt.Sprintf(

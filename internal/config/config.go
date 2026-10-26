@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -45,6 +46,13 @@ type Config struct {
 	MySQLAdminUser     string
 	MySQLAdminPass     string
 	MySQLAdminPassFile string
+
+	// Replication account used in CHANGE REPLICATION SOURCE (switchover/rejoin).
+	// Empty user falls back to the admin (guard) account.
+	MySQLReplUser      string
+	MySQLReplPass      string
+	MySQLReplPassFile  string
+	ReplConnectTimeout time.Duration
 
 	ConsulAddr      string
 	ConsulTokenFile string
@@ -115,28 +123,29 @@ func Load(args []string) (*Config, error) {
 	fs.SetOutput(os.Stderr)
 
 	c := &Config{
-		Mode:              ModeObserve,
-		Interval:          2 * time.Second,
-		ProbeTimeout:      3 * time.Second,
-		SlowThreshold:     4,
-		DeadAfter:         30 * time.Second,
-		VotesNeeded:       2,
-		SessionTTL:        15 * time.Second,
-		LockDelay:         15 * time.Second,
-		MinBetweenFail:    time.Hour,
-		MaxApplyLag:       30 * time.Second,
-		LagGateMaxWait:    0,
-		FenceGrace:        30 * time.Second,
-		ReplicaStale:      35 * time.Second,
-		ProxySQLMode:      ProxySQLMonitor,
-		ProxySQLWriterHG:  10,
-		ProxySQLReaderHG:  11,
-		ReplLagAlertSec:   30,
-		HTTPListen:        ":9470",
-		ConsulAddr:        "127.0.0.1:8500",
-		MySQLPort:         3306,
-		ConsulServiceName: "mysql-guard",
-		ActionLogMax:      500,
+		Mode:               ModeObserve,
+		Interval:           2 * time.Second,
+		ProbeTimeout:       3 * time.Second,
+		SlowThreshold:      4,
+		DeadAfter:          30 * time.Second,
+		VotesNeeded:        2,
+		SessionTTL:         15 * time.Second,
+		LockDelay:          15 * time.Second,
+		MinBetweenFail:     time.Hour,
+		MaxApplyLag:        30 * time.Second,
+		LagGateMaxWait:     0,
+		FenceGrace:         30 * time.Second,
+		ReplicaStale:       35 * time.Second,
+		ProxySQLMode:       ProxySQLMonitor,
+		ProxySQLWriterHG:   10,
+		ProxySQLReaderHG:   11,
+		ReplLagAlertSec:    30,
+		HTTPListen:         ":9470",
+		ConsulAddr:         "127.0.0.1:8500",
+		MySQLPort:          3306,
+		ReplConnectTimeout: 30 * time.Second,
+		ConsulServiceName:  "mysql-guard",
+		ActionLogMax:       500,
 	}
 
 	var peers string
@@ -147,7 +156,10 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar((*string)(&c.Mode), "mode", envOr("GUARD_MODE", "observe"), "observe, fence, or act")
 	fs.StringVar(&c.MySQLDSN, "mysql-dsn", envOr("MYSQL_DSN", ""), "full MySQL DSN override (must not include password if -mysql-password-file is set)")
 	fs.StringVar(&c.MySQLHost, "mysql-host", envOr("MYSQL_HOST", "127.0.0.1"), "MySQL host when building DSN from -mysql-user")
-	fs.IntVar(&c.MySQLPort, "mysql-port", c.MySQLPort, "MySQL port when building DSN")
+	fs.IntVar(&c.MySQLPort, "mysql-port", envInt("MYSQL_PORT", c.MySQLPort), "MySQL port when building DSN (env MYSQL_PORT)")
+	fs.StringVar(&c.MySQLReplUser, "mysql-repl-user", envOr("MYSQL_REPL_USER", ""), "replication account for CHANGE REPLICATION SOURCE (default: -mysql-user)")
+	fs.StringVar(&c.MySQLReplPassFile, "mysql-repl-password-file", envOr("MYSQL_REPL_PASSWORD_FILE", ""), "file containing the replication account password")
+	fs.DurationVar(&c.ReplConnectTimeout, "repl-connect-timeout", envDuration("REPL_CONNECT_TIMEOUT", c.ReplConnectTimeout), "max wait for re-pointed replica IO+SQL threads ON")
 	fs.StringVar(&c.MySQLAdminUser, "mysql-user", envOr("MYSQL_USER", ""), "MySQL admin user")
 	fs.StringVar(&c.MySQLAdminPassFile, "mysql-password-file", envOr("MYSQL_PASSWORD_FILE", ""), "file containing MySQL password")
 	fs.StringVar(&c.ConsulAddr, "consul-addr", envOr("CONSUL_HTTP_ADDR", c.ConsulAddr), "Consul HTTP address")
@@ -219,6 +231,18 @@ func Load(args []string) (*Config, error) {
 		c.MySQLAdminPass = envOr("MYSQL_PASSWORD", "")
 	}
 
+	if c.MySQLReplUser != "" {
+		if c.MySQLReplPassFile != "" {
+			b, err := os.ReadFile(c.MySQLReplPassFile)
+			if err != nil {
+				return nil, fmt.Errorf("read mysql repl password file: %w", err)
+			}
+			c.MySQLReplPass = strings.TrimSpace(string(b))
+		} else {
+			c.MySQLReplPass = envOr("MYSQL_REPL_PASSWORD", "")
+		}
+	}
+
 	if c.ConsulTokenFile != "" {
 		b, err := os.ReadFile(c.ConsulTokenFile)
 		if err != nil {
@@ -254,6 +278,33 @@ func envBool(key string, def bool) bool {
 		return def
 	}
 	return v == "1" || strings.EqualFold(v, "true") || v == "yes"
+}
+
+// ReplCredentials returns the account used for CHANGE REPLICATION SOURCE:
+// the dedicated replication user if set, otherwise the admin (guard) account.
+func (c *Config) ReplCredentials() (user, pass string) {
+	if c.MySQLReplUser != "" {
+		return c.MySQLReplUser, c.MySQLReplPass
+	}
+	return c.MySQLAdminUser, c.MySQLAdminPass
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
 }
 
 func envOr(key, def string) string {

@@ -198,6 +198,38 @@ primary_is db-b || fail "primary moved during nops drill"
 wait_for 30 "GTIDs match after nops drill" gtids_match
 pass "drill 7: no performance_schema grant -> db-a repl_state=unknown, no stopped alert, logged once, no actions, read_only unchanged ($RO_A/$RO_B)"
 
+src_user() { sqlq "$1" "SELECT USER FROM performance_schema.replication_connection_configuration LIMIT 1"; }
+count_res() { actions | jq --arg a "$1" --arg r "$2" '[.entries[] | select(.action==$a and .step=="end" and .result==$r)] | length'; }
+
+log "=== Drill 8: switchover verifies the new replica is connected via the repl account ==="
+N=$(count_ok switchover); E=$(kv_epoch)
+docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "drill 8 switchover exit"
+wait_for 20 "primary db-a on all guards" primary_is db-a
+check_roles db-a db-b
+replica_running db-b || fail "db-b threads not ON at switchover return"
+[ "$(src_user db-b)" = repl ] || fail "db-b source user $(src_user db-b), want repl"
+[ "$(count_ok switchover)" = $((N+1)) ] || fail "switchover ok not logged"
+actions | jq -e '[.entries[] | select(.action=="switchover" and .step=="end" and .result=="ok")][-1].reason | test("connected \\(user repl\\)")' >/dev/null || fail "ok message lacks connected/repl"
+write_row db-a d8-ok; wait_for 30 "d8-ok row on db-b" row_on db-b d8-ok
+pass "drill 8a: replica db-b ON/ON as user repl at switchover return, epoch $E->$(kv_epoch)"
+
+log "Drill 8b: broken repl password -> switchover logged degraded, never ok"
+sqlq db-a "ALTER USER 'repl'@'%' IDENTIFIED BY 'wrong-on-purpose'" || fail "break repl pw"
+wait_for 30 "GTIDs match" gtids_match
+N=$(count_ok switchover); D=$(count_res switchover degraded)
+if docker compose exec -T guard-a mysql-guard switchover db-b --node=db-a --mysql-host=db-a "${FLAGS[@]}"; then fail "degraded switchover exited 0"; fi
+wait_for 20 "primary db-b on all guards after degraded switchover" primary_is db-b
+check_roles db-b db-a
+[ "$(count_ok switchover)" = "$N" ] || fail "false ok logged for degraded switchover"
+[ "$(count_res switchover degraded)" = $((D+1)) ] || fail "degraded not logged"
+snap 08-degraded
+sqlq db-b "ALTER USER 'repl'@'%' IDENTIFIED BY 'placeholder'" || fail "restore repl pw"
+sqlq db-a "STOP REPLICA; START REPLICA" || fail "restart db-a replica"
+wait_for 60 "db-a replicating after pw restore" replica_running db-a
+wait_for 30 "GTIDs match" gtids_match
+write_row db-b d8-restored; wait_for 30 "d8-restored on db-a" row_on db-a d8-restored
+pass "drill 8b: degraded logged + non-zero exit, no false ok; recovered, gtid=$(gtid db-a)"
+
 SK=$(count_skipped)
 [ "$SK" = 0 ] || fail "$SK action log entries with result=skipped"
 one_leader || fail "leadership not single at end"

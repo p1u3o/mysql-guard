@@ -101,14 +101,30 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 		e.actionLog(ctx, newEpoch, "switchover", err.Error(), "warn", "proxysql_online_new")
 	}
 	srcHost, srcPort, _ := mysql.PeerHostPort(e.cfg, newPrimary)
-	if err := oldAdm.ChangeSourceAuto(ctx, srcHost, srcPort, e.cfg.MySQLAdminUser, e.cfg.MySQLAdminPass); err != nil {
+	replUser, replPass := e.cfg.ReplCredentials()
+	if err := oldAdm.ChangeSourceAuto(ctx, srcHost, srcPort, replUser, replPass); err != nil {
 		return e.abortSwitchoverPostEpoch(ctx, newEpoch, oldPrimary, newPrimary, err.Error())
 	}
 	if err := oldAdm.StartReplica(ctx); err != nil {
 		return e.abortSwitchoverPostEpoch(ctx, newEpoch, oldPrimary, newPrimary, err.Error())
 	}
-	e.actionLog(ctx, newEpoch, "switchover", fmt.Sprintf("%s -> %s complete at epoch %d", oldPrimary, newPrimary, newEpoch), "ok", "end")
+	// Never report ok until the re-pointed replica is actually connected.
+	if err := oldAdm.WaitReplicaConnected(ctx, e.cfg.ReplConnectTimeout); err != nil {
+		return e.degraded(ctx, newEpoch, "switchover", fmt.Sprintf("%s -> %s promoted at epoch %d but replica %s not connected (user %s): %s", oldPrimary, newPrimary, newEpoch, oldPrimary, replUser, err))
+	}
+	e.actionLog(ctx, newEpoch, "switchover", fmt.Sprintf("%s -> %s complete at epoch %d, replica %s connected (user %s)", oldPrimary, newPrimary, newEpoch, oldPrimary, replUser), "ok", "end")
 	return nil
+}
+
+// degraded logs action/end as result=degraded, alerts, and returns an error so
+// the CLI exits non-zero. The primary change itself is kept.
+func (e *Executor) degraded(ctx context.Context, epoch uint64, action, msg string) error {
+	e.actionLog(ctx, epoch, action, msg, "degraded", "end")
+	e.log.Error(action+" degraded", "msg", msg)
+	if e.alerts != nil {
+		_ = e.alerts.Alert(ctx, action+"-degraded", msg, true)
+	}
+	return fmt.Errorf("%s degraded: %s", action, msg)
 }
 
 // abortSwitchoverPostEpoch keeps the new primary, marks old needs-rebuild, alerts.

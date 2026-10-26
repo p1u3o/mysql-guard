@@ -25,3 +25,22 @@ func TestMinimalValid(t *testing.T) {
 		t.Fatalf("%+v", cfg)
 	}
 }
+
+func TestReplCredentialsFallbackAndEnvPort(t *testing.T) {
+	c := &Config{MySQLAdminUser: "guard", MySQLAdminPass: "g"}
+	if u, p := c.ReplCredentials(); u != "guard" || p != "g" {
+		t.Fatalf("fallback got %s/%s", u, p)
+	}
+	c.MySQLReplUser, c.MySQLReplPass = "repl", "r"
+	if u, p := c.ReplCredentials(); u != "repl" || p != "r" {
+		t.Fatalf("repl got %s/%s", u, p)
+	}
+	t.Setenv("MYSQL_PORT", "18401")
+	if envInt("MYSQL_PORT", 3306) != 18401 {
+		t.Fatal("MYSQL_PORT env not honoured")
+	}
+	t.Setenv("MYSQL_PORT", "")
+	if envInt("MYSQL_PORT", 3306) != 3306 {
+		t.Fatal("default port")
+	}
+}

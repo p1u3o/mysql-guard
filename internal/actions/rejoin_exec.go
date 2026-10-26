@@ -68,7 +68,8 @@ func (e *Executor) Rejoin(ctx context.Context, sourcePeer string, joinerPeer str
 		return rejoin.Plan{Outcome: rejoin.OutcomeNeedsRebuild, Reason: msg, Alert: msg}, fmt.Errorf("%s", msg)
 	}
 	host, port, _ := mysql.PeerHostPort(e.cfg, sourcePeer)
-	if err := joinerAdm.ChangeSourceAuto(ctx, host, port, e.cfg.MySQLAdminUser, e.cfg.MySQLAdminPass); err != nil {
+	replUser, replPass := e.cfg.ReplCredentials()
+	if err := joinerAdm.ChangeSourceAuto(ctx, host, port, replUser, replPass); err != nil {
 		e.actionLog(ctx, 0, "rejoin", err.Error(), "error", "change_source")
 		return plan, err
 	}
@@ -76,6 +77,9 @@ func (e *Executor) Rejoin(ctx context.Context, sourcePeer string, joinerPeer str
 		e.actionLog(ctx, 0, "rejoin", err.Error(), "error", "start_replica")
 		return plan, err
 	}
-	e.actionLog(ctx, 0, "rejoin", "complete", "ok", "end")
+	if err := joinerAdm.WaitReplicaConnected(ctx, e.cfg.ReplConnectTimeout); err != nil {
+		return plan, e.degraded(ctx, 0, "rejoin", fmt.Sprintf("%s re-pointed to %s but not connected (user %s): %s", joinerPeer, sourcePeer, replUser, err))
+	}
+	e.actionLog(ctx, 0, "rejoin", fmt.Sprintf("complete, %s replicating from %s (user %s)", joinerPeer, sourcePeer, replUser), "ok", "end")
 	return plan, nil
 }

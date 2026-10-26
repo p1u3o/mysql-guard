@@ -46,6 +46,7 @@ type Runtime struct {
 	lastWatch  time.Time
 	writable   map[string]int
 	deadTicks  int
+	roSince    time.Time // primary first seen reachable but read-only (zero = not read-only)
 	health     HealthReporter
 	stall      *stall.Tracker
 	stalled    map[string]string // node -> reason, this tick
@@ -375,8 +376,48 @@ func (r *Runtime) decide(ctx context.Context, now time.Time, maint bool, primary
 		r.setDecision("fence: " + p)
 	}
 
+	// A reachable primary that stays read-only past ReadOnlyGrace is failed.
+	// Complete data (superset of every peer) -> make it writable again
+	// (restore, epoch bump, not rate limited). Otherwise fail over.
+	roFailed := false
+	if po := obs[primary]; po.err == nil && po.st.ReadOnly {
+		r.mu.Lock()
+		if r.roSince.IsZero() {
+			r.roSince = now
+		}
+		since := r.roSince
+		lw := r.lastWriter
+		r.mu.Unlock()
+		if now.Sub(since) >= r.cfg.ReadOnlyGrace {
+			complete, why := r.primaryComplete(primary, po, obs, lw)
+			if complete {
+				if err := r.exec.RestoreWriter(ctx, primary, epoch, "primary "+primary+" read-only for "+now.Sub(since).Round(time.Second).String()+"; "+why); err != nil {
+					r.log.Error("restore writer failed", "node", primary, "err", err)
+					r.setDecision("restore_writer failed: " + err.Error())
+				} else {
+					r.mu.Lock()
+					r.roSince = time.Time{}
+					r.mu.Unlock()
+					r.setDecision("restore_writer: " + primary)
+				}
+				return dead
+			}
+			r.log.Warn("read-only primary is missing data; treating as failed", "node", primary, "why", why)
+			roFailed = true
+		} else {
+			r.setDecision("none: primary " + primary + " read-only (grace)")
+			return dead
+		}
+	} else {
+		r.mu.Lock()
+		r.roSince = time.Time{}
+		r.mu.Unlock()
+	}
+
 	r.mu.Lock()
-	if dead >= r.cfg.VotesNeeded {
+	if roFailed {
+		r.deadTicks = 3
+	} else if dead >= r.cfg.VotesNeeded {
 		r.deadTicks++
 	} else {
 		r.deadTicks = 0
@@ -435,6 +476,32 @@ func (r *Runtime) decide(ctx context.Context, now time.Time, maint bool, primary
 	r.mu.Unlock()
 	r.setDecision("failover: " + primary + " -> " + cand)
 	return dead
+}
+
+// primaryComplete reports whether the primary's executed set includes every
+// reachable peer's executed set and the last published writer set (used for
+// unreachable peers). Unknown state counts as incomplete.
+func (r *Runtime) primaryComplete(primary string, po peerObs, obs map[string]peerObs, lw consul.WriterGTID) (bool, string) {
+	own := gtid.Parse(po.st.Executed)
+	for _, p := range r.cfg.Peers {
+		if p == primary {
+			continue
+		}
+		o := obs[p]
+		if o.err != nil {
+			if lw.Executed == "" {
+				return false, "peer " + p + " unreachable and no last-writer GTID set known"
+			}
+			if !own.Superset(gtid.Parse(lw.Executed)) {
+				return false, "missing last-writer GTIDs " + string(gtid.Subtract(gtid.Parse(lw.Executed), own))
+			}
+			continue
+		}
+		if !own.Superset(gtid.Parse(o.st.Executed)) {
+			return false, "missing GTIDs from " + p + ": " + string(gtid.Subtract(gtid.Parse(o.st.Executed), own))
+		}
+	}
+	return true, "GTIDs include every peer's"
 }
 
 func (r *Runtime) setDecision(d string) {

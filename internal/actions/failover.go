@@ -104,3 +104,52 @@ func (e *Executor) Failover(ctx context.Context, oldPrimary, candidate string, e
 	e.actionLog(ctx, newEpoch, "failover", fmt.Sprintf("%s promoted at epoch %d", candidate, newEpoch), "ok", "end")
 	return nil
 }
+
+// RestoreWriter makes the current primary writable again after it came back
+// read-only with complete data. The writer does not change, so this is not a
+// failover and is not rate limited; the epoch is bumped so stale actors notice.
+func (e *Executor) RestoreWriter(ctx context.Context, primary string, epoch uint64, reason string) error {
+	if on, msg := e.maintenance(ctx); on {
+		e.actionLog(ctx, epoch, "restore_writer", msg, "blocked", "maintenance")
+		return nil
+	}
+	if e.observe || e.fenceOnly {
+		e.actionLog(ctx, epoch, "restore_writer", reason+" (mode "+string(e.cfg.Mode)+")", "skipped", "end")
+		return nil
+	}
+	if e.peers == nil {
+		return fmt.Errorf("peer pool not configured")
+	}
+	adm, err := e.peers.Admin(primary)
+	if err != nil {
+		return err
+	}
+	e.actionLog(ctx, epoch, "restore_writer", reason, "ok", "begin")
+	if err := adm.StopReplica(ctx); err != nil {
+		e.actionLog(ctx, epoch, "restore_writer", err.Error(), "error", "stop_replica")
+		return err
+	}
+	if err := adm.ResetReplicaAll(ctx); err != nil {
+		e.actionLog(ctx, epoch, "restore_writer", err.Error(), "error", "reset_replica")
+		return err
+	}
+	newEpoch, err := e.store.CasBumpEpoch(ctx, epoch)
+	if err != nil {
+		e.actionLog(ctx, epoch, "restore_writer", err.Error(), "error", "epoch_bump")
+		return err
+	}
+	if err := e.store.SetMaster(ctx, primary, newEpoch); err != nil {
+		e.actionLog(ctx, newEpoch, "restore_writer", err.Error(), "error", "set_master")
+		return err
+	}
+	if err := adm.PromoteWritable(ctx); err != nil {
+		e.actionLog(ctx, newEpoch, "restore_writer", err.Error(), "error", "promote_writable")
+		return err
+	}
+	// ProxySQL routing is unchanged: the writer node is the same.
+	if e.alerts != nil {
+		_ = e.alerts.Alert(ctx, "restore_writer", reason, true)
+	}
+	e.actionLog(ctx, newEpoch, "restore_writer", fmt.Sprintf("%s writable again at epoch %d", primary, newEpoch), "ok", "end")
+	return nil
+}

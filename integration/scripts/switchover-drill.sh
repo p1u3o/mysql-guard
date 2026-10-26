@@ -319,6 +319,47 @@ wait_for 30 "$R stall cleared" unstalled
 snap 10-dup-server-id
 pass "drill 10: $R with server_id=$DUP (= origin id of new events from $P) flagged stalled, failover refused while $P down (epoch $E), recovered, gtid=$(gtid "$P")"
 
+log "=== Drill 11: primary restarts read-only with complete data -> writable again (act) ==="
+P=$(kv_primary); R=db-b; [ "$P" = db-b ] && R=db-a
+wait_for 30 "GTIDs match before drill 11" gtids_match
+E=$(kv_epoch); NR=$(count_ok restore_writer); NF=$(count_ok failover)
+sqlq "$P" "SET GLOBAL super_read_only=ON" || fail "set $P read-only"
+[ "$(ro "$P")" = "11" ] || fail "$P not read-only"
+T0=$(date +%s)
+wait_for 40 "$P writable again" sh -c "[ \"\$(docker compose exec -T $P mysql -uroot -pplaceholder -N -B -e 'SELECT CONCAT(@@global.read_only,@@global.super_read_only)' 2>/dev/null)\" = 00 ]"
+log "writer restored after $(( $(date +%s) - T0 ))s"
+wait_for 20 "primary $P on all guards" primary_is "$P"
+epoch_gt() { [ "$(kv_epoch)" -gt "$1" ]; }
+wait_for 10 "epoch bumped past $E" epoch_gt "$E"
+[ "$(count_ok restore_writer)" = $((NR+1)) ] || fail "restore_writer end/ok not logged"
+[ "$(count_ok failover)" = "$NF" ] || fail "failover happened instead of restore"
+[ "$(ro "$R")" = "11" ] || fail "$R not read-only"
+write_row "$P" d11; wait_for 30 "d11 on $R" row_on "$R" d11; wait_for 30 "GTIDs match after drill 11" gtids_match
+snap 11-ro-primary-complete
+pass "drill 11: read-only $P with complete data made writable again, epoch $E->$(kv_epoch), no failover"
+
+log "=== Drill 12: primary read-only and missing data -> failover to the complete replica (act) ==="
+P=$(kv_primary); R=db-b; [ "$P" = db-b ] && R=db-a
+E=$(kv_epoch); NR=$(count_ok restore_writer); NF=$(count_ok failover)
+# Give R a transaction P does not have (read_only stays ON; root bypasses it).
+sqlq "$R" "SET GLOBAL super_read_only=OFF; INSERT INTO drill.t VALUES ('d12-only-on-r'); SET GLOBAL super_read_only=ON" || fail "extra row on $R"
+row_on "$P" d12-only-on-r && fail "row leaked to $P"
+sqlq "$P" "SET GLOBAL super_read_only=ON" || fail "set $P read-only"
+T0=$(date +%s)
+wait_for 60 "failover to $R" primary_is "$R"
+log "failover after $(( $(date +%s) - T0 ))s"
+[ "$(count_ok failover)" = $((NF+1)) ] || fail "failover end/ok not logged"
+[ "$(count_ok restore_writer)" = "$NR" ] || fail "incomplete $P was restored"
+[ "$(ro "$R")" = "00" ] || fail "$R not writable"
+[ "$(ro "$P")" = "11" ] || fail "$P writable (two writers)"
+wait_for 10 "epoch bumped past $E" epoch_gt "$E"
+docker compose exec -T guard-a mysql-guard rejoin "$R" --node="$P" --mysql-host="$P" "${FLAGS[@]}" || fail "rejoin $P under $R"
+wait_for 30 "$P replicating from $R" replica_running "$P"
+write_row "$R" d12; wait_for 30 "d12 on $P" row_on "$P" d12; wait_for 30 "d12-only-on-r on $P" row_on "$P" d12-only-on-r
+wait_for 30 "GTIDs match after drill 12" gtids_match
+snap 12-ro-primary-incomplete
+pass "drill 12: read-only $P missing data -> failover to $R, epoch $E->$(kv_epoch), $P rejoined, gtid=$(gtid "$R")"
+
 SK=$(count_skipped)
 [ "$SK" = 0 ] || fail "$SK action log entries with result=skipped"
 one_leader || fail "leadership not single at end"

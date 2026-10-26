@@ -78,6 +78,7 @@ type Config struct {
 	MaxApplyLag         time.Duration
 	LagGateMaxWait      time.Duration
 	FenceGrace          time.Duration
+	ReadOnlyGrace       time.Duration
 	ReplicaStale        time.Duration
 	ProxySQLMode        ProxySQLMode
 	ProxySQLAdminDSN    string
@@ -140,6 +141,7 @@ func Load(args []string) (*Config, error) {
 		MaxApplyLag:        30 * time.Second,
 		LagGateMaxWait:     0,
 		FenceGrace:         30 * time.Second,
+		ReadOnlyGrace:      10 * time.Second,
 		ReplicaStale:       35 * time.Second,
 		ProxySQLMode:       ProxySQLMonitor,
 		ProxySQLWriterHG:   10,
@@ -186,6 +188,7 @@ func Load(args []string) (*Config, error) {
 	fs.DurationVar(&c.MaxApplyLag, "max-apply-lag", c.MaxApplyLag, "allowed time to apply retrieved GTIDs")
 	fs.DurationVar(&c.LagGateMaxWait, "lag-gate-max-wait", c.LagGateMaxWait, "max wait for missing GTIDs; 0=never promote")
 	fs.DurationVar(&c.FenceGrace, "fence-grace", c.FenceGrace, "grace before fencing marked sole writer")
+	fs.DurationVar(&c.ReadOnlyGrace, "read-only-grace", c.ReadOnlyGrace, "reachable primary read-only this long counts as failed: restored if its GTIDs include every peer's, else failover")
 	fs.DurationVar(&c.ReplicaStale, "replica-stale", c.ReplicaStale, "heartbeat and last-queued trx stale threshold")
 	fs.StringVar((*string)(&c.ProxySQLMode), "proxysql-mode", envOr("PROXYSQL_MODE", "monitor"), "monitor or admin")
 	fs.StringVar(&c.ProxySQLAdminDSN, "proxysql-admin-dsn", envOr("PROXYSQL_ADMIN_DSN", ""), "ProxySQL admin DSN")

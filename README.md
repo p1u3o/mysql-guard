@@ -73,7 +73,27 @@ Admin updates match `mysql_servers` rows by **hostname and port**. Map logical p
 | `--proxysql-admin-enable` | `false` | Admin hostgroup updates on promote/fence |
 | `--ntfy-url` | | Replication / errant / fence alerts |
 | `--repl-lag-alert-sec` | `30` | IO/SQL/lag/read_only drift alerts |
+| `--min-between-failovers` | `1h` | Rate limit between real failovers (writer moves to another node) |
+| `--read-only-grace` | `10s` | A reachable primary that stays read-only this long counts as failed (see below) |
 | Maintenance KV | | `mysql/<cluster>/guard/maintenance` — any value pauses actions |
+
+## Read-only primary (v0.2.8)
+
+A primary that is reachable but stays read-only for longer than `--read-only-grace`
+(for example after a restart whose init waits for the guard) counts as failed:
+
+- If its `gtid_executed` includes every reachable peer's set (and the last published
+  writer set for any unreachable peer), the leader makes it writable again:
+  STOP/RESET REPLICA, CAS epoch bump, master key `<same node>|<epoch+1>`, then
+  `super_read_only=OFF, read_only=OFF`. Action log: `restore_writer`.
+- Otherwise it fails over to a complete replica through the normal failover path
+  (stall and superset gates apply).
+
+Rate limit decision: `--min-between-failovers` applies only between real failovers.
+A writer restore is not a failover (the writer does not move, so it cannot flap
+between nodes), is not rate limited, and does not reset the failover timer. A
+failover caused by an incomplete read-only primary is a real failover and is rate
+limited. Maintenance mode blocks both.
 
 ## License
 

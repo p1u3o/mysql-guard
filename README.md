@@ -123,3 +123,5 @@ Backups, log collection, automatic replication error skipping.
 ## Repository name
 
 The Go module path is `mysql-guard`. Rename the git remote/repository to `mysql-guard` in your forge when you create the repo (cloud agents cannot rename the remote).
+
+- `-repl-stmt-timeout` / `REPL_STMT_TIMEOUT` (default 30s): timeout for replication statements, with START REPLICA retry/backoff and post-drop state verification.

@@ -74,7 +74,9 @@ wait_for 120 "db-a healthy" sh -c "docker compose exec -T db-a mysqladmin ping -
 wait_for 120 "db-b ready" sh -c "docker compose exec -T db-b mysql -uroot -pplaceholder -e 'SELECT 1'"
 
 log "Configure replication db-b -> db-a (clear db-b init GTIDs first)"
-sqlq db-b "STOP REPLICA; RESET BINARY LOGS AND GTIDS; CHANGE REPLICATION SOURCE TO SOURCE_HOST='db-a', SOURCE_USER='repl', SOURCE_PASSWORD='placeholder', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1; START REPLICA; SET GLOBAL super_read_only=ON;" || fail "configure replication"
+cfg_repl() { sqlq db-b "STOP REPLICA; RESET BINARY LOGS AND GTIDS; CHANGE REPLICATION SOURCE TO SOURCE_HOST='db-a', SOURCE_USER='repl', SOURCE_PASSWORD='placeholder', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1; START REPLICA; SET GLOBAL super_read_only=ON;"; }
+# db-b may answer from its temporary init server and then restart: retry.
+wait_for 60 "replication configured on db-b" cfg_repl
 wait_for 60 "db-b replicating" replica_running db-b
 wait_for 60 "GTID sets match after bootstrap" gtids_match
 
@@ -229,6 +231,49 @@ wait_for 60 "db-a replicating after pw restore" replica_running db-a
 wait_for 30 "GTIDs match" gtids_match
 write_row db-b d8-restored; wait_for 30 "d8-restored on db-a" row_on db-a d8-restored
 pass "drill 8b: degraded logged + non-zero exit, no false ok; recovered, gtid=$(gtid db-a)"
+
+log "=== Drill 9: slow START REPLICA on the old primary (3s driver readTimeout would fail) ==="
+# CLI runs in guard-b; its self connection to db-b (old primary) goes through slowproxy.
+PFLAGS=("${FLAGS[@]}")
+run_proxy() { docker compose exec -T -d guard-b sh -c "exec slowproxy -listen 127.0.0.1:3399 -target db-b:3306 -mode $1 -delay 6s > /tmp/slowproxy-$1.log 2>&1"; sleep 1; }
+stop_proxy() { docker compose exec -T guard-b sh -c 'kill $(pidof slowproxy) 2>/dev/null; true'; }
+nr_keys() { docker compose exec -T consul consul kv get -recurse mysql/example/guard/needs-rebuild/ 2>/dev/null | wc -l | tr -d ' '; }
+[ "$(nr_keys)" = 0 ] || fail "needs-rebuild keys present before drill 9"
+
+# 9a: START REPLICA response delayed 6s (> old 3s readTimeout, < 30s repl-stmt-timeout)
+primary_is db-b || fail "drill 9 expects primary db-b"
+run_proxy delay
+N=$(count_ok switchover); E=$(kv_epoch); T0=$(date +%s)
+docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=127.0.0.1 --mysql-port=3399 "${PFLAGS[@]}" || { docker compose exec -T guard-b cat /tmp/slowproxy-delay.log; fail "drill 9a switchover exit"; }
+DT=$(( $(date +%s) - T0 ))
+docker compose exec -T guard-b cat /tmp/slowproxy-delay.log | grep -q 'DELAYING "START REPLICA" by 6s' || fail "proxy did not delay START REPLICA"
+stop_proxy
+wait_for 20 "primary db-a on all guards" primary_is db-a
+check_roles db-a db-b
+replica_running db-b || fail "db-b threads not ON"
+[ "$(src_user db-b)" = repl ] || fail "db-b source user"
+[ "$(count_ok switchover)" = $((N+1)) ] || fail "9a switchover ok not logged"
+[ "$(nr_keys)" = 0 ] || fail "needs-rebuild set in 9a"
+[ "$DT" -ge 6 ] || fail "9a took ${DT}s, delay not applied"
+write_row db-a d9a; wait_for 30 "d9a on db-b" row_on db-b d9a; wait_for 30 "GTIDs match" gtids_match
+pass "drill 9a: START REPLICA delayed 6s -> switchover ok in ${DT}s, epoch $E->$(kv_epoch), no needs-rebuild"
+
+# 9b: START REPLICA forwarded, then the connection drops: must reconnect, verify, not needs-rebuild
+log "Drill 9b: connection dropped right after START REPLICA"
+docker compose exec -T -d guard-a sh -c "exec slowproxy -listen 127.0.0.1:3399 -target db-a:3306 -mode drop > /tmp/slowproxy-drop.log 2>&1"; sleep 1
+N=$(count_ok switchover); E=$(kv_epoch)
+docker compose exec -T guard-a mysql-guard switchover db-b --node=db-a --mysql-host=127.0.0.1 --mysql-port=3399 "${PFLAGS[@]}" || { docker compose exec -T guard-a cat /tmp/slowproxy-drop.log; fail "drill 9b switchover exit"; }
+docker compose exec -T guard-a cat /tmp/slowproxy-drop.log | grep -q 'DROPPING client after "START REPLICA"' || fail "proxy did not drop after START REPLICA"
+docker compose exec -T guard-a sh -c 'kill $(pidof slowproxy) 2>/dev/null; true'
+wait_for 20 "primary db-b on all guards" primary_is db-b
+check_roles db-b db-a
+replica_running db-a || fail "db-a threads not ON"
+[ "$(count_ok switchover)" = $((N+1)) ] || fail "9b switchover ok not logged"
+[ "$(nr_keys)" = 0 ] || fail "needs-rebuild set in 9b"
+actions | jq -e '[.entries[] | select(.action=="switchover" and (.step=="start_replica_retry" or .step=="start_replica"))] | length >= 1' >/dev/null || fail "9b retry/verify not logged"
+write_row db-b d9b; wait_for 30 "d9b on db-a" row_on db-a d9b; wait_for 30 "GTIDs match" gtids_match
+snap 09-slow-start
+pass "drill 9b: dropped connection after START REPLICA -> state verified, ok, epoch $E->$(kv_epoch), no needs-rebuild, gtid=$(gtid db-a)"
 
 SK=$(count_skipped)
 [ "$SK" = 0 ] || fail "$SK action log entries with result=skipped"

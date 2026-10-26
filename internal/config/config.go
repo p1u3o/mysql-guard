@@ -53,6 +53,10 @@ type Config struct {
 	MySQLReplPass      string
 	MySQLReplPassFile  string
 	ReplConnectTimeout time.Duration
+	// ReplStmtTimeout bounds replication statements (CHANGE REPLICATION SOURCE,
+	// START/STOP/RESET REPLICA) and their state reads; it is also the driver
+	// read/write timeout of the dedicated replication connection pool.
+	ReplStmtTimeout time.Duration
 
 	ConsulAddr      string
 	ConsulTokenFile string
@@ -144,6 +148,7 @@ func Load(args []string) (*Config, error) {
 		ConsulAddr:         "127.0.0.1:8500",
 		MySQLPort:          3306,
 		ReplConnectTimeout: 30 * time.Second,
+		ReplStmtTimeout:    30 * time.Second,
 		ConsulServiceName:  "mysql-guard",
 		ActionLogMax:       500,
 	}
@@ -159,6 +164,7 @@ func Load(args []string) (*Config, error) {
 	fs.IntVar(&c.MySQLPort, "mysql-port", envInt("MYSQL_PORT", c.MySQLPort), "MySQL port when building DSN (env MYSQL_PORT)")
 	fs.StringVar(&c.MySQLReplUser, "mysql-repl-user", envOr("MYSQL_REPL_USER", ""), "replication account for CHANGE REPLICATION SOURCE (default: -mysql-user)")
 	fs.StringVar(&c.MySQLReplPassFile, "mysql-repl-password-file", envOr("MYSQL_REPL_PASSWORD_FILE", ""), "file containing the replication account password")
+	fs.DurationVar(&c.ReplStmtTimeout, "repl-stmt-timeout", envDuration("REPL_STMT_TIMEOUT", c.ReplStmtTimeout), "timeout for replication statements (CHANGE SOURCE, START/STOP/RESET REPLICA) and their connection pool")
 	fs.DurationVar(&c.ReplConnectTimeout, "repl-connect-timeout", envDuration("REPL_CONNECT_TIMEOUT", c.ReplConnectTimeout), "max wait for re-pointed replica IO+SQL threads ON")
 	fs.StringVar(&c.MySQLAdminUser, "mysql-user", envOr("MYSQL_USER", ""), "MySQL admin user")
 	fs.StringVar(&c.MySQLAdminPassFile, "mysql-password-file", envOr("MYSQL_PASSWORD_FILE", ""), "file containing MySQL password")

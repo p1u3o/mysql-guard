@@ -7,11 +7,23 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"mysql-guard/internal/config"
 
 	"github.com/go-sql-driver/mysql"
 )
+
+// WithIOTimeout returns dsn with readTimeout and writeTimeout set to d.
+func WithIOTimeout(dsn string, d time.Duration) (string, error) {
+	c, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", err
+	}
+	c.ReadTimeout = d
+	c.WriteTimeout = d
+	return c.FormatDSN(), nil
+}
 
 // BuildPeerDSN builds a DSN for a logical peer name.
 func BuildPeerDSN(cfg *config.Config, peer string) (string, error) {

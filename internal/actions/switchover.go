@@ -3,6 +3,7 @@ package actions
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"mysql-guard/internal/gtid"
 	"mysql-guard/internal/mysql"
@@ -102,11 +103,20 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 	}
 	srcHost, srcPort, _ := mysql.PeerHostPort(e.cfg, newPrimary)
 	replUser, replPass := e.cfg.ReplCredentials()
-	if err := oldAdm.ChangeSourceAuto(ctx, srcHost, srcPort, replUser, replPass); err != nil {
+	// needs-rebuild only if, after reconnecting, the actual source config is wrong.
+	recovered, err := oldAdm.ChangeSourceVerified(ctx, srcHost, srcPort, replUser, replPass)
+	if err != nil {
 		return e.abortSwitchoverPostEpoch(ctx, newEpoch, oldPrimary, newPrimary, err.Error())
 	}
-	if err := oldAdm.StartReplica(ctx); err != nil {
-		return e.abortSwitchoverPostEpoch(ctx, newEpoch, oldPrimary, newPrimary, err.Error())
+	if recovered {
+		e.actionLog(ctx, newEpoch, "switchover", "change source statement errored but actual source verified after reconnect", "warn", "change_source_verified")
+	}
+	// START REPLICA failures are not data problems: retry, then let the
+	// connected-wait below decide ok vs degraded.
+	if n, verified, err := oldAdm.StartReplicaRetry(ctx, 5, 500*time.Millisecond); err != nil {
+		e.actionLog(ctx, newEpoch, "switchover", err.Error(), "warn", "start_replica")
+	} else if n > 1 || verified {
+		e.actionLog(ctx, newEpoch, "switchover", fmt.Sprintf("START REPLICA succeeded on attempt %d (verified from thread state after error: %v)", n, verified), "warn", "start_replica_retry")
 	}
 	// Never report ok until the re-pointed replica is actually connected.
 	if err := oldAdm.WaitReplicaConnected(ctx, e.cfg.ReplConnectTimeout); err != nil {

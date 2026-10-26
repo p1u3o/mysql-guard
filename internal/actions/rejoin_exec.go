@@ -3,6 +3,7 @@ package actions
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"mysql-guard/internal/gtid"
 	"mysql-guard/internal/mysql"
@@ -69,13 +70,16 @@ func (e *Executor) Rejoin(ctx context.Context, sourcePeer string, joinerPeer str
 	}
 	host, port, _ := mysql.PeerHostPort(e.cfg, sourcePeer)
 	replUser, replPass := e.cfg.ReplCredentials()
-	if err := joinerAdm.ChangeSourceAuto(ctx, host, port, replUser, replPass); err != nil {
+	if recovered, err := joinerAdm.ChangeSourceVerified(ctx, host, port, replUser, replPass); err != nil {
 		e.actionLog(ctx, 0, "rejoin", err.Error(), "error", "change_source")
 		return plan, err
+	} else if recovered {
+		e.actionLog(ctx, 0, "rejoin", "change source statement errored but actual source verified after reconnect", "warn", "change_source_verified")
 	}
-	if err := joinerAdm.StartReplica(ctx); err != nil {
-		e.actionLog(ctx, 0, "rejoin", err.Error(), "error", "start_replica")
-		return plan, err
+	if n, verified, err := joinerAdm.StartReplicaRetry(ctx, 5, 500*time.Millisecond); err != nil {
+		e.actionLog(ctx, 0, "rejoin", err.Error(), "warn", "start_replica")
+	} else if n > 1 || verified {
+		e.actionLog(ctx, 0, "rejoin", fmt.Sprintf("START REPLICA succeeded on attempt %d (verified from thread state after error: %v)", n, verified), "warn", "start_replica_retry")
 	}
 	if err := joinerAdm.WaitReplicaConnected(ctx, e.cfg.ReplConnectTimeout); err != nil {
 		return plan, e.degraded(ctx, 0, "rejoin", fmt.Sprintf("%s re-pointed to %s but not connected (user %s): %s", joinerPeer, sourcePeer, replUser, err))

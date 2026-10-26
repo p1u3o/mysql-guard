@@ -12,11 +12,13 @@ import (
 type Pool struct {
 	cfg *config.Config
 	dbs map[string]*sql.DB
-	mu  sync.Mutex
+	// rdbs: per-peer pools for replication statements, readTimeout=ReplStmtTimeout.
+	rdbs map[string]*sql.DB
+	mu   sync.Mutex
 }
 
 func NewPool(cfg *config.Config) (*Pool, error) {
-	p := &Pool{cfg: cfg, dbs: map[string]*sql.DB{}}
+	p := &Pool{cfg: cfg, dbs: map[string]*sql.DB{}, rdbs: map[string]*sql.DB{}}
 	for _, peer := range cfg.Peers {
 		if err := p.ensure(peer); err != nil {
 			if len(cfg.MySQLPeerEndpoints) == 0 && peer != cfg.NodeName {
@@ -45,6 +47,18 @@ func (p *Pool) ensure(peer string) error {
 	}
 	db.SetConnMaxLifetime(0)
 	p.dbs[peer] = db
+	if t := p.cfg.ReplStmtTimeout; t > 0 {
+		rdsn, err := WithIOTimeout(dsn, t)
+		if err != nil {
+			return err
+		}
+		rdb, err := sql.Open("mysql", rdsn)
+		if err != nil {
+			return err
+		}
+		rdb.SetMaxIdleConns(1)
+		p.rdbs[peer] = rdb
+	}
 	return nil
 }
 
@@ -60,7 +74,10 @@ func (p *Pool) Admin(peer string) (*Admin, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewAdminDB(db), nil
+	p.mu.Lock()
+	rdb := p.rdbs[peer]
+	p.mu.Unlock()
+	return &Admin{db: db, repl: rdb, stmtTimeout: p.cfg.ReplStmtTimeout}, nil
 }
 
 // ReadState loads GTID/replication state for a peer.
@@ -76,6 +93,9 @@ func (p *Pool) ReadState(ctx context.Context, peer string) (GTIDState, error) {
 func (p *Pool) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	for _, db := range p.rdbs {
+		_ = db.Close()
+	}
 	for _, db := range p.dbs {
 		_ = db.Close()
 	}

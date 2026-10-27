@@ -295,8 +295,8 @@ job "mysql-guard-<cluster>" {
       driver = "exec"
 
       artifact {
-        # arm64: mysql-guard-v0.3.4-linux-arm64.tar.gz
-        source      = "<artifact-base-url>/mysql-guard-v0.3.4-linux-amd64.tar.gz"
+        # arm64: mysql-guard-v0.3.6-linux-arm64.tar.gz
+        source      = "<artifact-base-url>/mysql-guard-v0.3.6-linux-amd64.tar.gz"
         destination = "local/"
         options { checksum = "sha256:<sha256-from-release>" }
       }
@@ -337,7 +337,7 @@ job "mysql-guard-<cluster>" {
     task "guard" {
       driver = "exec"
       artifact {
-        source      = "<artifact-base-url>/mysql-guard-v0.3.4-linux-arm64.tar.gz"
+        source      = "<artifact-base-url>/mysql-guard-v0.3.6-linux-arm64.tar.gz"
         destination = "local/"
         options { checksum = "sha256:<sha256-from-release>" }
       }

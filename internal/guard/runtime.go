@@ -46,7 +46,8 @@ type Runtime struct {
 	lastWatch  time.Time
 	writable   map[string]int
 	deadTicks  int
-	roSince    time.Time // primary first seen reachable but read-only (zero = not read-only)
+	pHold      primaryHold // v0.3.7 replica-alert hold while the primary recovers
+	roSince    time.Time   // primary first seen reachable but read-only (zero = not read-only)
 	health     HealthReporter
 	stall      *stall.Tracker
 	stalled    map[string]string // node -> reason, this tick
@@ -226,6 +227,9 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 		topology, obs = r.buildTopology(ctx, primary)
 		r.trackStalls(ctx, now, primary, epochKV, topology, obs)
 		th.stalled = r.stalledNodes()
+		if po, ok := obs[primary]; ok {
+			r.observePrimary(now, primary, epochKV, po.err != nil, po.err == nil && po.st.ReadOnly)
+		}
 	}
 	if checks.Replication {
 		replSt := replhealth.State{Node: r.cfg.NodeName, ExpectReadOnly: primary != "" && r.cfg.NodeName != primary}
@@ -248,7 +252,7 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 			r.mu.RLock()
 			replSt.StallReason, replSt.Stalled = r.stalled[r.cfg.NodeName], r.stalled[r.cfg.NodeName] != ""
 			r.mu.RUnlock()
-			if !r.gateHolding(primary, epochKV) {
+			if !r.gateHolding(primary, epochKV) && !(replSt.ExpectReadOnly && r.recoveryHolding(now)) { // v0.3.7 hold applies to the replica only
 				r.exec.PublishReplicationAlerts(ctx, replSt)
 			}
 		}

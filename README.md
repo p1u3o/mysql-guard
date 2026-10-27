@@ -217,6 +217,8 @@ Every option is a flag. Where an env var column has a value, the env var sets th
 | `-fence-followup-window` | `FENCE_FOLLOWUP_WINDOW` | `30m` | After a failover, the old primary waiting to rejoin is fenced without a separate alert, and its replication alerts are held for this long |
 | `-foreign-write-alert` | `FOREIGN_WRITE_ALERT` | `true` | Alert when something other than a guard writes the master key |
 
+Since v0.3.7, while the primary is down or read-only and the guard is restoring it (writable again in the same epoch, or a failover), the replica's `repl_*` alerts are held, so the event sends exactly one alert (`restore_writer` or `failover`). The hold ends one vote period after the primary is healthy again.
+
 Boolean env vars accept `1`, `true` or `yes`.
 
 ## Required MySQL grants and Consul policy
@@ -295,8 +297,8 @@ job "mysql-guard-<cluster>" {
       driver = "exec"
 
       artifact {
-        # arm64: mysql-guard-v0.3.6-linux-arm64.tar.gz
-        source      = "<artifact-base-url>/mysql-guard-v0.3.6-linux-amd64.tar.gz"
+        # arm64: mysql-guard-v0.3.7-linux-arm64.tar.gz
+        source      = "<artifact-base-url>/mysql-guard-v0.3.7-linux-amd64.tar.gz"
         destination = "local/"
         options { checksum = "sha256:<sha256-from-release>" }
       }
@@ -337,7 +339,7 @@ job "mysql-guard-<cluster>" {
     task "guard" {
       driver = "exec"
       artifact {
-        source      = "<artifact-base-url>/mysql-guard-v0.3.6-linux-arm64.tar.gz"
+        source      = "<artifact-base-url>/mysql-guard-v0.3.7-linux-arm64.tar.gz"
         destination = "local/"
         options { checksum = "sha256:<sha256-from-release>" }
       }

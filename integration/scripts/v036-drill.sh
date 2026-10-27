@@ -249,7 +249,37 @@ writes_land_on db-a d5b-after
 dns_check "D5b restored" db-a db-b
 snap d5b; pass "D5b: async fallback alerted once; host loss while async was refused by the gate (one alert)"
 
+log "=== D6 (v0.3.7): primary mysqld killed and restarted read-only at once -> restore_writer, one alert ==="
+ev_begin; E=$(kv_epoch)
+# the test pair's start.sh brings mysqld up read-only; emulate it for this one restart
+sqlq db-a "SET PERSIST_ONLY read_only=ON; SET PERSIST_ONLY super_read_only=ON"
+docker compose kill db-a >/dev/null; docker compose start db-a >/dev/null
+wait_for 60 "D6 db-a up read-only" sh -c "[ \"\$(docker compose exec -T db-a mysql -uroot -pplaceholder -N -B -e 'SELECT @@global.super_read_only' 2>/dev/null)\" = 1 ]"
+wait_for 120 "D6 db-a writable again" sh -c "[ \"\$(docker compose exec -T db-a mysql -uroot -pplaceholder -N -B -e 'SELECT @@global.super_read_only' 2>/dev/null)\" = 0 ]"
+primary_key_is db-a || fail "D6: failed over instead of restoring db-a"
+sqlq db-a "RESET PERSIST read_only; RESET PERSIST super_read_only"
+sqlq db-a "SET GLOBAL rpl_semi_sync_source_enabled=ON"
+sqlq db-b "STOP REPLICA IO_THREAD; START REPLICA IO_THREAD"
+writes_land_on db-a d6
+two_writers && fail "D6 TWO WRITERS"
+dns_check "D6 restored" db-a db-b
+EV_WAIT=40 ev_check "D6 restore" restore_writer
+snap d6; pass "D6: restarted read-only primary made writable again; replica repl_* held (one alert)"
+
+log "=== D7 (v0.3.7): primary mysqld stopped and kept down (guard-a up) -> failover, one alert ==="
+ev_begin; E=$(kv_epoch)
+docker compose stop db-a >/dev/null
+wait_for 120 "D7 failover to db-b" primary_key_is db-b
+writes_land_on db-b d7
+dns_check "D7 failed over" db-b ""
+two_writers && fail "D7 TWO WRITERS"
+docker compose start db-a >/dev/null
+wait_for 60 "D7 db-a fenced" sh -c "[ \"\$(docker compose exec -T db-a mysql -uroot -pplaceholder -N -B -e 'SELECT CONCAT(@@global.read_only,@@global.super_read_only)' 2>/dev/null)\" = 11 ]"
+EV_WAIT=20 ev_check "D7 failover" failover
+snap d7; back_to_a D7
+pass "D7: mysqld kept down failed over with one alert, rejoined, switched back"
+
 two_writers && fail "TWO WRITERS at end"
 SK=$(curl -sf "http://127.0.0.1:9471/api/actions" | jq '[.[] | select(.result=="skipped")] | length'); [ "$SK" = 0 ] || fail "$SK skipped actions"
 log "alerts delivered: $(alerts | sort | uniq -c | tr '\n' ';')"
-log "ALL V0.3.6 DRILLS PASSED"
+log "ALL V0.3.6 DRILLS PASSED (incl. v0.3.7 D6/D7)"

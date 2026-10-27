@@ -59,6 +59,17 @@ type Runtime struct {
 	pxSince      time.Time
 	pxAlerted    string
 	svcLastErr   string
+
+	// v0.3.6
+	primaryProbe string // witness connect check of the primary: ok, dead, "" (not probing)
+	ioLost       bool
+	ioReason     string
+	selfSemi     string
+	semi         semiSample // last sample of the primary's semi-sync state
+	semiBlocked  string     // primary|epoch already alerted as blocked by the semi-sync gate
+	quorum       Quorum
+	members      *memberDebounce
+	memberErr    string
 }
 
 // Version is the build version shown in /status (set from main via ldflags).
@@ -158,15 +169,17 @@ func (r *Runtime) healthLoop(ctx context.Context) {
 
 // Checks lists which probes a guard role performs.
 type Checks struct {
-	MySQL       bool // local/peer MySQL probes, topology, seed and failover decisions
-	Replication bool // replication health alerts
+	MySQL        bool // local/peer MySQL probes, topology, seed and failover decisions
+	Replication  bool // replication health alerts
+	PrimaryProbe bool // witness: connect check of the primary (a quorum vote, v0.3.6)
 }
 
-// ChecksFor returns the checks a role runs. Witness guards only take part in
-// Consul coordination and never touch MySQL.
+// ChecksFor returns the checks a role runs. Witness guards never act on MySQL;
+// since v0.3.6 they connect-check the primary (SELECT 1 with the read-only
+// login) when -witness-probe is on and credentials are configured.
 func ChecksFor(role config.Role) Checks {
 	if role == config.RoleWitness {
-		return Checks{}
+		return Checks{PrimaryProbe: true}
 	}
 	return Checks{MySQL: true, Replication: true}
 }
@@ -223,6 +236,14 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 			replSt.IOThreadOn = st.IOThread || !replSt.ExpectReadOnly
 			replSt.SQLThreadOn = st.SQLThread || !replSt.ExpectReadOnly
 			replSt.LagSeconds = st.LagSeconds
+			replSt.SemiSyncFellBack = !replSt.ExpectReadOnly && st.SemiSync.FellBack()
+			lost, why := false, ""
+			if replSt.ExpectReadOnly {
+				lost, why = st.IO.LostSource(r.cfg.ReplicaStale)
+			}
+			r.mu.Lock()
+			r.ioLost, r.ioReason, r.selfSemi = lost, why, st.SemiSync.Mode()
+			r.mu.Unlock()
 			r.mu.RLock()
 			replSt.StallReason, replSt.Stalled = r.stalled[r.cfg.NodeName], r.stalled[r.cfg.NodeName] != ""
 			r.mu.RUnlock()
@@ -233,6 +254,10 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 	primaryOK := false
 	if checks.MySQL && primary != "" {
 		primaryOK = obs[primary].err == nil
+		r.sampleSemiSync(ctx, now, primary, epochKV, obs[primary])
+	}
+	if checks.PrimaryProbe {
+		r.witnessProbe(ctx, primary)
 	}
 
 	if checks.MySQL && r.lock.VerifyLeaderBeforeAction(r.cfg.SessionTTL) {
@@ -259,6 +284,9 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 	if checks.MySQL && r.lock.IsLeader() {
 		po := obs[primary]
 		r.v030Checks(ctx, now, maint, primary, epochKV, po.err == nil && po.st.ReadOnly)
+		if primary != "" && r.cfg.Mode == config.ModeAct && !maint && r.lock.VerifyLeaderBeforeAction(r.cfg.SessionTTL) {
+			r.syncMembers(ctx, now, primary, epochKV, obs)
+		}
 	}
 	r.metrics.DeadVotes.WithLabelValues("total").Set(float64(dead))
 	r.lastHealth = now
@@ -333,31 +361,20 @@ func boolToF(v bool) float64 {
 	return 0
 }
 
-// CountDeadVotes counts DB guards that currently see primary as unreachable.
-// Only fresh reports about the same primary count; witnesses do not vote.
-func CountDeadVotes(self string, selfPrimaryOK bool, primary string, guards []consul.GuardInstance, now time.Time, maxAge time.Duration) int {
-	votes := 0
-	if !selfPrimaryOK {
-		votes++
-	}
-	for _, g := range guards {
-		if g.Node == self || g.Role != string(config.RoleDB) {
-			continue
-		}
-		if g.PrimaryView != primary || now.Sub(g.LastHeartbeat) > maxAge {
-			continue
-		}
-		if !g.PrimaryOK {
-			votes++
-		}
-	}
-	return votes
-}
-
 // decide runs leader-only fence and failover logic; returns dead vote count.
 func (r *Runtime) decide(ctx context.Context, now time.Time, maint bool, primary string, epoch uint64, obs map[string]peerObs) int {
 	guards, _ := r.store.ListGuardInstances(ctx)
-	dead := CountDeadVotes(r.cfg.NodeName, obs[primary].err == nil, primary, guards, now, 3*r.cfg.Interval+time.Second)
+	r.mu.RLock()
+	selfIO := r.ioLost
+	r.mu.RUnlock()
+	q := CountQuorum(QuorumInput{
+		Self: r.cfg.NodeName, SelfRole: string(r.cfg.Role), SelfPrimaryOK: obs[primary].err == nil, SelfIOLost: selfIO,
+		Primary: primary, Guards: guards, Now: now, MaxAge: 3*r.cfg.Interval + time.Second,
+	})
+	r.mu.Lock()
+	r.quorum = q
+	r.mu.Unlock()
+	dead := q.Votes
 	if maint {
 		r.setDecision("none: maintenance mode")
 		return dead
@@ -474,10 +491,15 @@ func (r *Runtime) decide(ctx context.Context, now time.Time, maint bool, primary
 			cand = c
 		}
 	}
+	semiNote, ok := r.semiSyncGate(ctx, primary, epoch)
+	if !ok {
+		return dead
+	}
 	if r.cfg.Mode == config.ModeObserve {
 		r.metrics.WouldActTotal.Inc()
 	}
-	if err := r.exec.Failover(ctx, primary, cand, epoch); err != nil {
+	r.log.Warn("primary declared dead", "primary", primary, "votes", q.Votes, "voters", q.String())
+	if err := r.exec.FailoverWithNote(ctx, primary, cand, epoch, "votes: "+q.String()+"; "+semiNote); err != nil {
 		r.log.Error("failover failed", "err", err)
 		r.setDecision("failover failed: " + err.Error())
 		return dead
@@ -551,6 +573,10 @@ func (r *Runtime) refreshStatus(ctx context.Context, now time.Time, dead int, ma
 		LoopRenewSec: renewAge, LoopHealthSec: healthAge, LoopWatchSec: watchAge,
 		PrimaryView: primary, PrimaryOK: primaryOK,
 	}
+	r.mu.RLock()
+	inst.PrimaryProbe, inst.ReplicaIOLost, inst.ReplicaIOReason, inst.SemiSync = r.primaryProbe, r.ioLost, r.ioReason, r.selfSemi
+	quorum := r.quorum
+	r.mu.RUnlock()
 	_ = r.store.PutGuardInstance(ctx, inst)
 
 	guards := []GuardTopology{{
@@ -573,6 +599,7 @@ func (r *Runtime) refreshStatus(ctx context.Context, now time.Time, dead int, ma
 	r.status.Leader = leader
 	r.status.Version = Version
 	r.status.DeadVotes = dead
+	r.status.Voters = quorum.Voters
 	r.status.Primary = primary
 	r.status.Epoch = epoch
 	r.status.Maintenance = maint

@@ -105,6 +105,9 @@ type GTIDState struct {
 	HasReplicationSource bool
 	ReplKnown            bool
 	ReplErr              string
+	// v0.3.6
+	IO       IOHealth
+	SemiSync SemiSync
 }
 
 // ReplState summarises replication for display: running, stopped, partial,
@@ -203,6 +206,10 @@ func (p *Prober) ReadGTIDState(ctx context.Context) (GTIDState, error) {
 		return GTIDState{}, err
 	}
 	readReplication(ctx, dbScanner(p.db), &st)
+	if st.HasReplicationSource {
+		st.IO = readIOHealth(ctx, p.db)
+	}
+	st.SemiSync = readSemiSync(ctx, p.db)
 	return st, nil
 }
 

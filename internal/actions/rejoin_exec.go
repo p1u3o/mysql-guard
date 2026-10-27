@@ -76,6 +76,7 @@ func (e *Executor) Rejoin(ctx context.Context, sourcePeer string, joinerPeer str
 	} else if recovered {
 		e.actionLog(ctx, 0, "rejoin", "change source statement errored but actual source verified after reconnect", "warn", "change_source_verified")
 	}
+	semiAfter := e.semiRejoinBefore(ctx, sourceAdm, joinerAdm, "rejoin", 0)
 	if n, verified, err := joinerAdm.StartReplicaRetry(ctx, 5, 500*time.Millisecond); err != nil {
 		e.actionLog(ctx, 0, "rejoin", err.Error(), "warn", "start_replica")
 	} else if n > 1 || verified {
@@ -83,6 +84,9 @@ func (e *Executor) Rejoin(ctx context.Context, sourcePeer string, joinerPeer str
 	}
 	if err := joinerAdm.WaitReplicaConnected(ctx, e.cfg.ReplConnectTimeout); err != nil {
 		return plan, e.degraded(ctx, 0, "rejoin", fmt.Sprintf("%s re-pointed to %s but not connected (user %s): %s", joinerPeer, sourcePeer, replUser, err))
+	}
+	if semiAfter {
+		e.semiRejoinAfter(ctx, sourceAdm, sourcePeer, "rejoin", 0)
 	}
 	e.actionLog(ctx, 0, "rejoin", fmt.Sprintf("complete, %s replicating from %s (user %s)", joinerPeer, sourcePeer, replUser), "ok", "end")
 	return plan, nil

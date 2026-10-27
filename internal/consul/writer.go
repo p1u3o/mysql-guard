@@ -42,6 +42,12 @@ type Options struct {
 	Format    MasterFormat
 	Endpoints map[string]string // node -> host:port (legacy write and read mapping)
 	Writer    WriterService
+	Members   MemberService
+}
+
+// MemberService configures the per-member catalog entries (members.go).
+type MemberService struct {
+	Name string // empty = disabled
 }
 
 // SetOptions installs adapter options (call once after NewStore).
@@ -118,6 +124,13 @@ func (s *Store) SetMaster(ctx context.Context, node string, epoch uint64) error 
 	if s.opts.Writer.Name != "" {
 		if _, err := s.SyncWriterService(ctx, node, epoch, "guard"); err != nil {
 			return fmt.Errorf("master key set but writer service sync failed: %w", err)
+		}
+	}
+	if s.opts.Members.Name != "" {
+		// the new writer moves at once; every other member is "fenced" until
+		// the leader's next tick sees it replicating from the new primary.
+		if _, err := s.SyncMembers(ctx, epoch, map[string]MemberState{node: {Role: MemberWriter, Status: capi.HealthPassing, Reason: "promoted"}}, "guard"); err != nil {
+			return fmt.Errorf("master key set but member service sync failed: %w", err)
 		}
 	}
 	return nil

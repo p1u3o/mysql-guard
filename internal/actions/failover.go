@@ -40,11 +40,20 @@ func (e *Executor) FenceNode(ctx context.Context, node string, epoch uint64, rea
 // Failover promotes candidate after the primary was voted dead.
 // The candidate must first apply every GTID it already received.
 func (e *Executor) Failover(ctx context.Context, oldPrimary, candidate string, epoch uint64) error {
+	return e.FailoverWithNote(ctx, oldPrimary, candidate, epoch, "")
+}
+
+// FailoverWithNote is Failover with a note (votes, semi-sync state at loss)
+// appended to the reason and the failover alert.
+func (e *Executor) FailoverWithNote(ctx context.Context, oldPrimary, candidate string, epoch uint64, note string) error {
 	if on, msg := e.maintenance(ctx); on {
 		e.actionLog(ctx, epoch, "failover", msg, "blocked", "maintenance")
 		return nil
 	}
 	reason := fmt.Sprintf("primary %s voted dead; candidate %s", oldPrimary, candidate)
+	if note != "" {
+		reason += " (" + note + ")"
+	}
 	if e.observe || e.fenceOnly {
 		e.actionLog(ctx, epoch, "failover", reason+" (mode "+string(e.cfg.Mode)+")", "skipped", "end")
 		return nil
@@ -81,6 +90,7 @@ func (e *Executor) Failover(ctx context.Context, oldPrimary, candidate string, e
 		e.actionLog(ctx, epoch, "failover", err.Error(), "error", "reset_replica")
 		return err
 	}
+	e.semiFailoverPromote(ctx, adm, st, candidate, epoch)
 	if err := adm.PromoteWritable(ctx); err != nil {
 		e.actionLog(ctx, epoch, "failover", err.Error(), "error", "promote_writable")
 		return err

@@ -158,3 +158,15 @@ func (e *Executor) fenceAlert(ctx context.Context, node, reason string) {
 		_ = e.alerts.Alert(ctx, "fence", reason, true)
 	}
 }
+
+// anyFailoverFollowup: a failover ran or ended < FenceFollowupWindow ago.
+func (e *Executor) anyFailoverFollowup(ctx context.Context) bool {
+	if e.store == nil {
+		return false
+	}
+	t, err := e.store.GetTransition(ctx)
+	if err != nil || t == nil {
+		return false
+	}
+	return failoverFollowup(t, t.From, time.Now())
+}

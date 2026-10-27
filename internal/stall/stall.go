@@ -30,6 +30,7 @@ type Result struct {
 
 type entry struct {
 	gap     int64
+	exec    int64 // executed transaction count: growth means the applier progresses
 	since   time.Time
 	stalled bool
 	reason  string
@@ -45,7 +46,8 @@ type Tracker struct {
 func New(after time.Duration) *Tracker { return &Tracker{After: after, m: map[string]*entry{}} }
 
 // Observe updates the node's state. A replica is stalled when its threads are ON,
-// its GTID gap to the writer is non-zero and has not shrunk for After. When the
+// its GTID gap to the writer is non-zero and neither the gap has shrunk nor the
+// replica's executed set has grown for After. When the
 // writer cannot be read the previous verdict is kept (sticky), so a stalled node
 // is still excluded while the writer is down.
 func (t *Tracker) Observe(now time.Time, o Obs) Result {
@@ -63,11 +65,14 @@ func (t *Tracker) Observe(now time.Time, o Obs) Result {
 		delete(t.m, o.Node)
 		return Result{Gap: gap}
 	}
+	exec := o.Executed.Count()
 	if e == nil {
-		e = &entry{gap: gap, since: now}
+		e = &entry{gap: gap, exec: exec, since: now}
 		t.m[o.Node] = e
-	} else if gap < e.gap {
-		e.gap, e.since, e.stalled = gap, now, false
+	} else if gap < e.gap || exec > e.exec {
+		// v0.3.6: a replica that keeps applying under steady writes (or a delayed
+		// replica) holds a constant gap but is not stalled.
+		e.gap, e.exec, e.since, e.stalled = gap, exec, now, false
 	}
 	if now.Sub(e.since) >= t.After {
 		e.stalled = true

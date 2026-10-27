@@ -281,7 +281,16 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 			dead = r.decide(ctx, now, maint, primary, epochKV, obs)
 		}
 	}
-	if checks.MySQL && r.lock.IsLeader() {
+	// v0.3.6: a failover/seed in this tick changed the writer; the observations above
+	// describe the old topology, so writer/member sync waits for the next tick
+	// (otherwise the old primary is briefly re-published as writer).
+	topoChanged := false
+	if primary != "" && checks.MySQL && r.lock.IsLeader() {
+		if p2, e2, err := r.store.GetPrimary(ctx); err == nil && (p2 != primary || e2 != epochKV) {
+			topoChanged = true
+		}
+	}
+	if checks.MySQL && r.lock.IsLeader() && !topoChanged {
 		po := obs[primary]
 		r.v030Checks(ctx, now, maint, primary, epochKV, po.err == nil && po.st.ReadOnly)
 		if primary != "" && r.cfg.Mode == config.ModeAct && !maint && r.lock.VerifyLeaderBeforeAction(r.cfg.SessionTTL) {

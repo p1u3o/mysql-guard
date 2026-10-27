@@ -20,6 +20,9 @@ type State struct {
 	// Stalled: threads ON but the GTID gap to the writer is not shrinking.
 	Stalled     bool
 	StallReason string
+	// SemiSyncFellBack (v0.3.6, primary only): semi-sync source is enabled but
+	// the server fell back to async (no replica acknowledging).
+	SemiSyncFellBack bool
 }
 
 // Alert is a replication hygiene issue.
@@ -51,6 +54,9 @@ func Evaluate(st State, cfg Config) []Alert {
 	}
 	if !st.Unknown && cfg.MaxLagSeconds > 0 && st.LagSeconds > cfg.MaxLagSeconds {
 		out = append(out, Alert{Severity: "warning", Code: "repl_lag", Message: fmt.Sprintf("%s: lag %.1fs over %.1fs", st.Node, st.LagSeconds, cfg.MaxLagSeconds)})
+	}
+	if st.SemiSyncFellBack && !st.ExpectReadOnly {
+		out = append(out, Alert{Severity: "critical", Code: "semisync_async", Message: fmt.Sprintf("%s: semi-sync fell back to async (no replica acknowledging); a failover now could lose acknowledged writes, so automatic failover is blocked until it is sync again", st.Node)})
 	}
 	if st.ExpectReadOnly && !st.ReadOnly {
 		out = append(out, Alert{Severity: "critical", Code: "read_only_drift", Message: fmt.Sprintf("%s: expected read_only", st.Node)})

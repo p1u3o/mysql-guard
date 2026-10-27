@@ -1,0 +1,25 @@
+# v0.3.6 drills (D1-D5): semi-sync plugins, member service + checks, act mode.
+# Use with: docker compose -f docker-compose.yml -f docker-compose.v030.yml -f docker-compose.v036.yml
+services:
+  db-a:
+    command: ["--server-id=1", "--log-bin=mysql-bin", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--plugin-load-add=semisync_source.so", "--plugin-load-add=semisync_replica.so", "--replica-net-timeout=10"]
+  db-b:
+    command: ["--server-id=2", "--log-bin=mysql-bin", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--plugin-load-add=semisync_source.so", "--plugin-load-add=semisync_replica.so", "--replica-net-timeout=10"]
+  consul:
+    ports:
+      - "8600:8600/udp"
+  guard-a: &g
+    environment:
+      GUARD_MODE: act
+      MEMBER_SERVICE: example-mysql
+      MEMBER_MAX_LAG: "5"
+      MEMBER_CHECK_DELAY: 6s
+      REPL_SOURCE_SSL: "1"
+      FENCE_FOLLOWUP_WINDOW: ${FFW:-180s}
+  guard-b: *g
+  guard-witness: *g
+  loader:
+    build:
+      context: ..
+      dockerfile: integration/Dockerfile
+    entrypoint: ["sleep", "infinity"]

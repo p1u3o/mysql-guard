@@ -23,6 +23,16 @@ type GuardInstance struct {
 	// PrimaryView is the primary this guard probed; PrimaryOK its reachability.
 	PrimaryView string `json:"primary_view,omitempty"`
 	PrimaryOK   bool   `json:"primary_ok"`
+	// v0.3.6 quorum inputs (see guard/quorum.go).
+	// PrimaryProbe is the witness connect check of PrimaryView: "ok", "dead",
+	// or "" (not probing: no credentials/endpoints; never a vote).
+	PrimaryProbe string `json:"primary_probe,omitempty"`
+	// ReplicaIOLost: this db guard's local IO thread has lost the primary
+	// (connecting, erroring, or no event/heartbeat for -replica-stale).
+	ReplicaIOLost   bool   `json:"replica_io_lost,omitempty"`
+	ReplicaIOReason string `json:"replica_io_reason,omitempty"`
+	// SemiSync is this db guard's local semi-sync mode (sync/async/off/unknown).
+	SemiSync string `json:"semisync,omitempty"`
 }
 
 func (k KeyPaths) GuardInstance(node string) string {

@@ -81,6 +81,10 @@ func (r *Runtime) v030Checks(ctx context.Context, now time.Time, maint bool, pri
 			r.pxSince = time.Time{}
 			return
 		}
+		if msg != "" && r.gateHolding(primary, epoch) {
+			r.pxSince = time.Time{}
+			return
+		}
 		if msg == "" {
 			if r.pxAlerted != "" {
 				r.exec.Alert(ctx, "proxysql_writer_ok", "ProxySQL writer hostgroup matches "+primary+" again", false)

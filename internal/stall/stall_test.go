@@ -69,3 +69,17 @@ func itoa(n int64) string {
 	}
 	return s
 }
+
+// v0.3.6: steady writes with a delayed/busy applier keep a constant gap while the
+// replica's executed set grows; that is lag, not a stall.
+func TestConstantGapButApplyingNotStalled(t *testing.T) {
+	tr := New(10 * time.Second)
+	t0 := time.Unix(1000, 0)
+	for i := int64(0); i < 10; i++ {
+		o := Obs{Node: "r", ThreadsOn: true, SourceKnown: true, SourceExecuted: gtid.Set(u + ":1-" + itoa(115+i*5)),
+			Executed: gtid.Set(u + ":1-" + itoa(100+i*5)), Retrieved: gtid.Set(u + ":1-" + itoa(115+i*5))}
+		if r := tr.Observe(t0.Add(time.Duration(i)*5*time.Second), o); r.Stalled || r.Gap != 15 {
+			t.Fatalf("tick %d: %+v", i, r)
+		}
+	}
+}

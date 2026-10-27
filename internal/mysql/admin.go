@@ -16,6 +16,7 @@ type Admin struct {
 	db          *sql.DB
 	repl        *sql.DB       // replication-statement pool (long read timeout); falls back to db
 	stmtTimeout time.Duration // per replication statement; default 30s
+	sourceSSL   bool          // CHANGE REPLICATION SOURCE ... SOURCE_SSL=1
 }
 
 func (a *Admin) replDB() *sql.DB {
@@ -194,11 +195,20 @@ func waitThreads(ctx context.Context, read threadReader, timeout, every time.Dur
 
 // ChangeSourceAuto sets replication source with auto positioning.
 func (a *Admin) ChangeSourceAuto(ctx context.Context, host string, port int, user, password string) error {
+	return a.replExec(ctx, changeSourceSQL(host, port, user, password, a.sourceSSL))
+}
+
+func changeSourceSQL(host string, port int, user, password string, ssl bool) string {
 	q := fmt.Sprintf(
 		"CHANGE REPLICATION SOURCE TO SOURCE_HOST='%s', SOURCE_PORT=%d, SOURCE_USER='%s', SOURCE_PASSWORD='%s', SOURCE_AUTO_POSITION=1, GET_SOURCE_PUBLIC_KEY=1",
 		escapeSQL(host), port, escapeSQL(user), escapeSQL(password),
 	)
-	return a.replExec(ctx, q)
+	if ssl {
+		q += ", SOURCE_SSL=1"
+	} else {
+		q += ", SOURCE_SSL=0"
+	}
+	return q
 }
 
 // ReplicaSource reads the configured source of the default channel.

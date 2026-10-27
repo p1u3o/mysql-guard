@@ -27,8 +27,8 @@ kv_primary() { status 9473 | jq -r '.primary'; }
 kv_epoch() { status 9473 | jq -r '.epoch'; }
 ro() { sqlq "$1" "SELECT CONCAT(@@global.read_only, @@global.super_read_only)"; }
 gtid() { sqlq "$1" "SELECT REPLACE(@@global.gtid_executed, '\n', '')"; }
-count_ok() { actions | jq --arg a "$1" --arg s "${2:-end}" '[.entries[] | select(.action==$a and .step==$s and .result=="ok")] | length'; }
-count_skipped() { actions | jq '[.entries[] | select(.result=="skipped")] | length'; }
+count_ok() { actions | jq --arg a "$1" --arg s "${2:-end}" '[.[] | select(.action==$a and .step==$s and .result=="ok")] | length'; }
+count_skipped() { actions | jq '[.[] | select(.result=="skipped")] | length'; }
 
 snap() {
   local s="$1"
@@ -195,7 +195,7 @@ echo "$NL" | grep -q '"code":"repl_state_unknown"' || fail "nops guard did not l
 echo "$NL" | grep -qE 'repl_(io|sql)_stopped' && fail "nops guard reported stopped on a permission error"
 # logged only when the alert set changes (seeding may change it once), never per 2s tick
 [ "$(echo "$NL" | grep -c '"code":"repl_state_unknown"')" -le 2 ] || fail "repl_state_unknown repeated per tick (spam)"
-[ "$(curl -sf -m5 http://127.0.0.1:9474/api/actions | jq '[.entries[]? | select(.action!="seed_primary")] | length')" = 0 ] || fail "nops guard took actions"
+[ "$(curl -sf -m5 http://127.0.0.1:9474/api/actions | jq '[.[]? | select(.action!="seed_primary")] | length')" = 0 ] || fail "nops guard took actions"
 [ "$(ro db-a)" = "$RO_A" ] && [ "$(ro db-b)" = "$RO_B" ] || fail "read_only changed during nops drill"
 curl -sf -m5 http://127.0.0.1:9474/status > "$SNAPDIR/07-nops-status.json" || true
 docker rm -f "${COMPOSE_PROJECT_NAME:-integration}-nops" >/dev/null
@@ -205,7 +205,7 @@ wait_for 30 "GTIDs match after nops drill" gtids_match
 pass "drill 7: no performance_schema grant -> db-a repl_state=unknown, no stopped alert, logged once, no actions, read_only unchanged ($RO_A/$RO_B)"
 
 src_user() { sqlq "$1" "SELECT USER FROM performance_schema.replication_connection_configuration LIMIT 1"; }
-count_res() { actions | jq --arg a "$1" --arg r "$2" '[.entries[] | select(.action==$a and .step=="end" and .result==$r)] | length'; }
+count_res() { actions | jq --arg a "$1" --arg r "$2" '[.[] | select(.action==$a and .step=="end" and .result==$r)] | length'; }
 
 log "=== Drill 8: switchover verifies the new replica is connected via the repl account ==="
 N=$(count_ok switchover); E=$(kv_epoch)
@@ -215,7 +215,7 @@ check_roles db-a db-b
 replica_running db-b || fail "db-b threads not ON at switchover return"
 [ "$(src_user db-b)" = repl ] || fail "db-b source user $(src_user db-b), want repl"
 [ "$(count_ok switchover)" = $((N+1)) ] || fail "switchover ok not logged"
-actions | jq -e '[.entries[] | select(.action=="switchover" and .step=="end" and .result=="ok")][-1].reason | test("connected \\(user repl\\)")' >/dev/null || fail "ok message lacks connected/repl"
+actions | jq -e '[.[] | select(.action=="switchover" and .step=="end" and .result=="ok")][-1].reason | test("connected \\(user repl\\)")' >/dev/null || fail "ok message lacks connected/repl"
 write_row db-a d8-ok; wait_for 30 "d8-ok row on db-b" row_on db-b d8-ok
 pass "drill 8a: replica db-b ON/ON as user repl at switchover return, epoch $E->$(kv_epoch)"
 
@@ -275,7 +275,7 @@ check_roles db-b db-a
 replica_running db-a || fail "db-a threads not ON"
 [ "$(count_ok switchover)" = $((N+1)) ] || fail "9b switchover ok not logged"
 [ "$(nr_keys)" = 0 ] || fail "needs-rebuild set in 9b"
-actions | jq -e '[.entries[] | select(.action=="switchover" and (.step=="start_replica_retry" or .step=="start_replica"))] | length >= 1' >/dev/null || fail "9b retry/verify not logged"
+actions | jq -e '[.[] | select(.action=="switchover" and (.step=="start_replica_retry" or .step=="start_replica"))] | length >= 1' >/dev/null || fail "9b retry/verify not logged"
 write_row db-b d9b; wait_for 30 "d9b on db-a" row_on db-a d9b; wait_for 30 "GTIDs match" gtids_match
 snap 09-slow-start
 pass "drill 9b: dropped connection after START REPLICA -> state verified, ok, epoch $E->$(kv_epoch), no needs-rebuild, gtid=$(gtid db-a)"
@@ -310,7 +310,7 @@ sleep 25
 [ "$(kv_primary)" = "$P" ] || fail "primary moved to stalled $R"
 [ "$(kv_epoch)" = "$E" ] || fail "epoch bumped $E->$(kv_epoch)"
 [ "$(count_ok failover)" = "$NF" ] || fail "failover ok logged with stalled candidate"
-actions | jq -e '[.entries[] | select(.step=="stalled_candidate" and .result=="blocked")] | length >= 1' >/dev/null || fail "stalled_candidate block not logged"
+actions | jq -e '[.[] | select(.step=="stalled_candidate" and .result=="blocked")] | length >= 1' >/dev/null || fail "stalled_candidate block not logged"
 [ "$(ro "$R")" != "00" ] || fail "$R became writable"
 docker compose start "$P"
 wait_for 120 "$P back" sh -c "docker compose exec -T $P mysql -uroot -pplaceholder -e 'SELECT 1'"

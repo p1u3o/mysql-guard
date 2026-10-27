@@ -9,7 +9,7 @@ RUN CGO_ENABLED=0 go build -trimpath -tags "${TAGS}" -ldflags="-s -w -X main.ver
 RUN CGO_ENABLED=0 go build -trimpath -o /slowproxy ./integration/slowproxy
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates dnsutils default-mysql-client && rm -rf /var/lib/apt/lists/*
 COPY --from=build /mysql-guard /usr/local/bin/mysql-guard
 COPY --from=build /slowproxy /usr/local/bin/slowproxy
 ENTRYPOINT ["mysql-guard"]

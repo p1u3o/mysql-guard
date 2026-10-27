@@ -168,6 +168,7 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 	}
 	// START REPLICA failures are not data problems: retry, then let the
 	// connected-wait below decide ok vs degraded.
+	semiAfter := e.semiRejoinBefore(ctx, newAdm, oldAdm, "switchover", newEpoch)
 	if n, verified, err := oldAdm.StartReplicaRetry(ctx, 5, 500*time.Millisecond); err != nil {
 		e.actionLog(ctx, newEpoch, "switchover", err.Error(), "warn", "start_replica")
 	} else if n > 1 || verified {
@@ -176,6 +177,9 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 	// Never report ok until the re-pointed replica is actually connected.
 	if err := oldAdm.WaitReplicaConnected(ctx, e.cfg.ReplConnectTimeout); err != nil {
 		return e.degraded(ctx, newEpoch, "switchover", fmt.Sprintf("%s -> %s promoted at epoch %d but replica %s not connected (user %s): %s", oldPrimary, newPrimary, newEpoch, oldPrimary, replUser, err))
+	}
+	if semiAfter {
+		e.semiRejoinAfter(ctx, newAdm, newPrimary, "switchover", newEpoch)
 	}
 	e.actionLog(ctx, newEpoch, "switchover", fmt.Sprintf("%s -> %s complete at epoch %d, replica %s connected (user %s)", oldPrimary, newPrimary, newEpoch, oldPrimary, replUser), "ok", "end")
 	e.Alert(ctx, "switchover", fmt.Sprintf("%s -> %s complete at epoch %d", oldPrimary, newPrimary, newEpoch), false)

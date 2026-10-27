@@ -30,6 +30,9 @@ type Store struct {
 	seenIdx uint64 // master key ModifyIndex last observed
 	ownIdx  uint64 // master key ModifyIndex of our last write
 	foreign string // set when the master key changed but not by this guard
+
+	memMu   sync.Mutex
+	memLast map[string]memberWritten // member/writer-check entries last written by this guard
 }
 
 func NewStore(addr, token string, cluster string) (*Store, error) {
@@ -162,4 +165,11 @@ func (s *Store) GetWriterGTID(ctx context.Context) (*WriterGTID, error) {
 		return nil, err
 	}
 	return &rec, nil
+}
+
+// NeedsRebuildMarked reports whether node carries a needs-rebuild mark
+// (cleared by the operator after the rebuild).
+func (s *Store) NeedsRebuildMarked(ctx context.Context, node string) bool {
+	pair, _, err := s.client.KV().Get(s.keys.NeedsRebuild(node), (&capi.QueryOptions{}).WithContext(ctx))
+	return err == nil && pair != nil && len(pair.Value) > 0
 }

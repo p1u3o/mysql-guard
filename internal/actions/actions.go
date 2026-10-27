@@ -158,12 +158,18 @@ func (e *Executor) PublishReplicationAlerts(ctx context.Context, st replhealth.S
 			break
 		}
 	}
+	// semisync_async on a new primary is expected while the failed old
+	// primary waits to be rejoined (failover follow-up window): hold it.
+	if !held && st.SemiSyncFellBack && e.anyFailoverFollowup(ctx) {
+		held = true
+	}
 	e.replMu.Lock()
 	if e.replFirst == nil {
 		e.replFirst = map[string]time.Time{}
 	}
 	alerts = filterThreadAlerts(alerts, e.replFirst, held, e.cfg.ReplThreadAlertDelay, time.Now())
 	e.replMu.Unlock()
+	prev := e.lastReplCodes()
 	if !e.replAlertsChanged(alerts) {
 		return
 	}
@@ -171,11 +177,26 @@ func (e *Executor) PublishReplicationAlerts(ctx context.Context, st replhealth.S
 		e.log.Info("replication", "code", "ok", "msg", st.Node+": replication alerts cleared")
 	}
 	for _, a := range alerts {
+		if prev[a.Code] {
+			continue // v0.3.6: already alerted; only new codes alert (one alert per event)
+		}
 		e.log.Warn("replication", "code", a.Code, "msg", a.Message)
 		if e.alerts != nil {
 			_ = e.alerts.Alert(ctx, a.Code, a.Message, a.Severity == "critical")
 		}
 	}
+}
+
+func (e *Executor) lastReplCodes() map[string]bool {
+	e.replMu.Lock()
+	defer e.replMu.Unlock()
+	m := map[string]bool{}
+	if e.lastReplKey != "" {
+		for _, c := range strings.Split(e.lastReplKey, ",") {
+			m[c] = true
+		}
+	}
+	return m
 }
 
 // replAlertsChanged reports whether the set of alert codes differs from the last

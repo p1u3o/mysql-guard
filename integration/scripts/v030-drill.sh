@@ -28,8 +28,8 @@ kv_primary() { status 9473 | jq -r '.primary'; }
 kv_epoch() { status 9473 | jq -r '.epoch'; }
 ro() { sqlq "$1" "SELECT CONCAT(@@global.read_only, @@global.super_read_only)"; }
 gtid() { sqlq "$1" "SELECT REPLACE(@@global.gtid_executed, '\n', '')"; }
-count_ok() { actions | jq --arg a "$1" --arg s "${2:-end}" '[.entries[] | select(.action==$a and .step==$s and .result=="ok")] | length'; }
-count_skipped() { actions | jq '[.entries[] | select(.result=="skipped")] | length'; }
+count_ok() { actions | jq --arg a "$1" --arg s "${2:-end}" '[.[] | select(.action==$a and .step==$s and .result=="ok")] | length'; }
+count_skipped() { actions | jq '[.[] | select(.result=="skipped")] | length'; }
 
 snap() {
   local s="$1"

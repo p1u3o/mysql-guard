@@ -31,6 +31,7 @@ func storeOptions(cfg *config.Config) consul.Options {
 		Format:    consul.MasterFormat(cfg.MasterFormat),
 		Endpoints: eps,
 		Writer:    consul.WriterService{Name: cfg.WriterServiceName, Tags: cfg.WriterServiceTags},
+		Members:   consul.MemberService{Name: cfg.MemberServiceName},
 	}
 }
 

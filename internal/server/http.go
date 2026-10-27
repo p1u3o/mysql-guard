@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"io/fs"
+	"mysql-guard/internal/actionlog"
 	"net/http"
 	"sync"
 
@@ -80,5 +81,14 @@ func (s *HTTPServer) handleActions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"entries": list})
+	_ = json.NewEncoder(w).Encode(actionsBody(list))
+}
+
+// actionsBody is the /api/actions response: always a JSON array, never null
+// (an empty or missing action log used to encode as {"entries":null}).
+func actionsBody(list []actionlog.Entry) []actionlog.Entry {
+	if list == nil {
+		return []actionlog.Entry{}
+	}
+	return list
 }

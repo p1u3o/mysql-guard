@@ -55,6 +55,7 @@ type Status struct {
 	Version        string                   `json:"version"`
 	Leader         bool                     `json:"leader"`
 	DeadVotes      int                      `json:"dead_votes"`
+	Voters         []string                 `json:"voters,omitempty"`
 	LastDecision   string                   `json:"last_decision"`
 	Epoch          uint64                   `json:"epoch"`
 	Primary        string                   `json:"primary"`

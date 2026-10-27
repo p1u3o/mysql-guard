@@ -3,7 +3,11 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sync"
+	"time"
+
+	gomysql "github.com/go-sql-driver/mysql"
 
 	"mysql-guard/internal/config"
 )
@@ -77,7 +81,7 @@ func (p *Pool) Admin(peer string) (*Admin, error) {
 	p.mu.Lock()
 	rdb := p.rdbs[peer]
 	p.mu.Unlock()
-	return &Admin{db: db, repl: rdb, stmtTimeout: p.cfg.ReplStmtTimeout}, nil
+	return &Admin{db: db, repl: rdb, stmtTimeout: p.cfg.ReplStmtTimeout, sourceSSL: p.cfg.ReplSourceSSL}, nil
 }
 
 // ReadState loads GTID/replication state for a peer.
@@ -88,6 +92,27 @@ func (p *Pool) ReadState(ctx context.Context, peer string) (GTIDState, error) {
 	}
 	pr := &Prober{db: db, cfg: ProbeConfig{Timeout: p.cfg.ProbeTimeout}}
 	return pr.ReadGTIDState(ctx)
+}
+
+// Ping is a connect check of a peer: alive when the server answered (even
+// with a MySQL error such as access denied), dead on a network error or timeout.
+func (p *Pool) Ping(ctx context.Context, peer string, timeout time.Duration) (alive bool, err error) {
+	db, err := p.DB(peer)
+	if err != nil {
+		return false, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var one int
+	err = db.QueryRowContext(ctx, "SELECT 1").Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	var me *gomysql.MySQLError
+	if errors.As(err, &me) {
+		return true, err
+	}
+	return false, err
 }
 
 func (p *Pool) Close() {

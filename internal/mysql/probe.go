@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -105,6 +106,9 @@ type GTIDState struct {
 	HasReplicationSource bool
 	ReplKnown            bool
 	ReplErr              string
+	// v0.3.6
+	IO       IOHealth
+	SemiSync SemiSync
 }
 
 // ReplState summarises replication for display: running, stopped, partial,
@@ -203,7 +207,43 @@ func (p *Prober) ReadGTIDState(ctx context.Context) (GTIDState, error) {
 		return GTIDState{}, err
 	}
 	readReplication(ctx, dbScanner(p.db), &st)
+	if st.HasReplicationSource {
+		st.IO = readIOHealth(ctx, p.db)
+	}
+	st.SemiSync = readSemiSync(ctx, p.db)
+	if st.HasReplicationSource && st.SQLThread {
+		st.LagSeconds = readLagSeconds(ctx, p.db)
+	}
 	return st, nil
+}
+
+// readLagSeconds returns Seconds_Behind_Source (best effort; 0 when NULL or unreadable).
+func readLagSeconds(ctx context.Context, db *sql.DB) float64 {
+	rows, err := db.QueryContext(ctx, "SHOW REPLICA STATUS")
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil || !rows.Next() {
+		return 0
+	}
+	vals := make([]sql.RawBytes, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if rows.Scan(ptrs...) != nil {
+		return 0
+	}
+	for i, c := range cols {
+		if c == "Seconds_Behind_Source" || c == "Seconds_Behind_Master" {
+			if v, err := strconv.ParseFloat(string(vals[i]), 64); err == nil {
+				return v
+			}
+		}
+	}
+	return 0
 }
 
 func (p *Prober) SetSuperReadOnly(ctx context.Context) error {

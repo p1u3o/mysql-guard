@@ -45,8 +45,15 @@
       rows + '</tbody></table>' + pxTable;
   }
 
+  // asList accepts an array, {entries: [...]}, null or anything else.
+  function asList(v) {
+    if (Array.isArray(v)) return v;
+    if (v && Array.isArray(v.entries)) return v.entries;
+    return [];
+  }
+
   function renderActions(list) {
-    const rows = (list || []).slice().reverse().map(function (e) {
+    const rows = asList(list).slice().reverse().map(function (e) {
       const cls = e.result === 'blocked' || e.result === 'error' ? 'badge bad' : (e.result === 'warn' ? 'badge warn' : 'badge');
       return '<tr><td>' + esc(e.timestamp) + '</td><td>' + esc(e.epoch) + '</td><td>' + esc(e.guard) + '</td><td>' +
         esc(e.action) + '</td><td>' + esc(e.reason) + '</td><td><span class="' + cls + '">' + esc(e.result) + '</span></td><td>' + esc(e.step) + '</td></tr>';
@@ -62,7 +69,7 @@
     ]).then(function (res) {
       renderGuards(res[0]);
       renderCluster(res[0]);
-      renderActions(res[1].entries || res[1]);
+      renderActions(res[1]);
       updated.textContent = 'Updated ' + new Date().toLocaleTimeString();
     }).catch(function (err) {
       updated.textContent = 'Refresh failed: ' + err;

@@ -81,14 +81,16 @@ type Config struct {
 	FenceDrainTimeout        time.Duration
 	SwitchoverCatchupTimeout time.Duration
 	LagGateMaxWait           time.Duration
-	FenceGrace               time.Duration
 	ReadOnlyGrace            time.Duration
-	ReplicaStale             time.Duration
-	ProxySQLMode             ProxySQLMode
-	ProxySQLAdminDSN         string
-	ProxySQLAdminEnable      bool
-	ProxySQLWriterHG         int
-	ProxySQLReaderHG         int
+	// ReplicaStale: a replica whose IO thread received nothing (no event and no
+	// heartbeat) for this long, or whose IO thread is connecting/erroring, has
+	// "lost the primary" (v0.3.6 replica IO vote, see quorum.go).
+	ReplicaStale        time.Duration
+	ProxySQLMode        ProxySQLMode
+	ProxySQLAdminDSN    string
+	ProxySQLAdminEnable bool
+	ProxySQLWriterHG    int
+	ProxySQLReaderHG    int
 
 	NtfyURL              string
 	ReplLagAlertSec      float64
@@ -111,11 +113,20 @@ type Config struct {
 	MasterFormat        string // epoch | legacy
 	WriterServiceName   string // Consul catalog service pointing at the writer ("" = off)
 	WriterServiceTags   []string
+	MemberServiceName   string        // v0.3.6: per-member catalog entries tagged writer/reader/lagging/fenced ("" = off)
+	MemberMaxLag        float64       // reader lag limit (seconds) for the member checks
+	MemberCheckDelay    time.Duration // debounce: a member state must persist this long before it is written
 	ProxySQLVerify      bool          // read-only check of the ProxySQL writer hostgroup via admin
 	ProxySQLVerifyGrace time.Duration // mismatch must persist this long before alerting
 	ForeignWriteAlert   bool          // alert when the master key was written by something other than a guard
 	NtfyTokenFile       string
 	NtfyToken           string
+
+	// v0.3.6
+	WitnessProbe    bool // witness probes the primary with a MySQL connect check (needs -mysql-user and -mysql-peer-endpoints)
+	SemiSyncGate    bool // refuse automatic failover when acknowledged writes could be lost (semi-sync enabled but last seen async)
+	SemiSyncRestore bool // re-enable semi-sync on the new primary/replica after failover, switchover and rejoin
+	ReplSourceSSL   bool // CHANGE REPLICATION SOURCE ... SOURCE_SSL=1
 }
 
 // ProxySQLConfig is passed to the ProxySQL client.
@@ -159,7 +170,6 @@ func Load(args []string) (*Config, error) {
 		MaxApplyLag:          30 * time.Second,
 		FenceDrainTimeout:    3 * time.Second,
 		LagGateMaxWait:       0,
-		FenceGrace:           30 * time.Second,
 		ReadOnlyGrace:        10 * time.Second,
 		ReplicaStale:         35 * time.Second,
 		ProxySQLMode:         ProxySQLMonitor,
@@ -178,74 +188,14 @@ func Load(args []string) (*Config, error) {
 		ActionLogMax:         500,
 	}
 
-	var peers string
-	var writerTags string
-	var proxysqlPeers string
-	var mysqlPeers string
-	fs.StringVar(&c.NodeName, "node", envOr("GUARD_NODE", ""), "this node's logical name")
-	fs.StringVar((*string)(&c.Role), "role", envOr("GUARD_ROLE", "db"), "db or witness")
-	fs.StringVar((*string)(&c.Mode), "mode", envOr("GUARD_MODE", "observe"), "observe, fence, or act")
-	fs.StringVar(&c.MySQLDSN, "mysql-dsn", envOr("MYSQL_DSN", ""), "full MySQL DSN override (must not include password if -mysql-password-file is set)")
-	fs.StringVar(&c.MySQLHost, "mysql-host", envOr("MYSQL_HOST", "127.0.0.1"), "MySQL host when building DSN from -mysql-user")
-	fs.IntVar(&c.MySQLPort, "mysql-port", envInt("MYSQL_PORT", c.MySQLPort), "MySQL port when building DSN (env MYSQL_PORT)")
-	fs.StringVar(&c.MySQLReplUser, "mysql-repl-user", envOr("MYSQL_REPL_USER", ""), "replication account for CHANGE REPLICATION SOURCE (default: -mysql-user)")
-	fs.StringVar(&c.MySQLReplPassFile, "mysql-repl-password-file", envOr("MYSQL_REPL_PASSWORD_FILE", ""), "file containing the replication account password")
-	fs.DurationVar(&c.ReplStmtTimeout, "repl-stmt-timeout", envDuration("REPL_STMT_TIMEOUT", c.ReplStmtTimeout), "timeout for replication statements (CHANGE SOURCE, START/STOP/RESET REPLICA) and their connection pool")
-	fs.DurationVar(&c.ReplConnectTimeout, "repl-connect-timeout", envDuration("REPL_CONNECT_TIMEOUT", c.ReplConnectTimeout), "max wait for re-pointed replica IO+SQL threads ON")
-	fs.StringVar(&c.MySQLAdminUser, "mysql-user", envOr("MYSQL_USER", ""), "MySQL admin user")
-	fs.StringVar(&c.MySQLAdminPassFile, "mysql-password-file", envOr("MYSQL_PASSWORD_FILE", ""), "file containing MySQL password")
-	fs.StringVar(&c.ConsulAddr, "consul-addr", envOr("CONSUL_HTTP_ADDR", c.ConsulAddr), "Consul HTTP address")
-	fs.StringVar(&c.ConsulTokenFile, "consul-token-file", envOr("CONSUL_TOKEN_FILE", ""), "Consul ACL token file")
-	fs.StringVar(&c.ClusterName, "cluster", envOr("GUARD_CLUSTER", ""), "cluster name for KV keys (required)")
-	fs.StringVar(&peers, "peers", envOr("GUARD_PEERS", ""), "comma-separated db peer names (required)")
-	fs.StringVar(&c.HTTPListen, "http", envOr("GUARD_HTTP", c.HTTPListen), "HTTP listen address")
-	fs.DurationVar(&c.Interval, "interval", c.Interval, "health loop interval")
-	fs.DurationVar(&c.ProbeTimeout, "probe-timeout", c.ProbeTimeout, "per-probe deadline")
-	fs.IntVar(&c.SlowThreshold, "slow-threshold", c.SlowThreshold, "consecutive slow probes before failed")
-	fs.DurationVar(&c.DeadAfter, "dead-after", c.DeadAfter, "time since first failure before vote counts dead")
-	fs.IntVar(&c.VotesNeeded, "votes-needed", c.VotesNeeded, "dead votes required of 3")
-	fs.DurationVar(&c.SessionTTL, "session-ttl", c.SessionTTL, "Consul session TTL")
-	fs.DurationVar(&c.LockDelay, "lock-delay", c.LockDelay, "Consul lock delay")
-	fs.DurationVar(&c.MinBetweenFail, "min-between-failovers", c.MinBetweenFail, "rate limit between failovers")
-	fs.DurationVar(&c.MaxApplyLag, "max-apply-lag", c.MaxApplyLag, "allowed time to apply retrieved GTIDs")
-	fs.DurationVar(&c.FenceDrainTimeout, "fence-drain-timeout", envDuration("FENCE_DRAIN_TIMEOUT", c.FenceDrainTimeout), "switchover: wait for open transactions on the fenced source, then kill them")
-	fs.DurationVar(&c.SwitchoverCatchupTimeout, "switchover-catchup-timeout", envDuration("SWITCHOVER_CATCHUP_TIMEOUT", c.SwitchoverCatchupTimeout), "switchover: max wait for the target to apply the fenced source's final GTID set (0 = 2x max-apply-lag); on timeout the source is made writable again, epoch unchanged")
-	fs.DurationVar(&c.LagGateMaxWait, "lag-gate-max-wait", c.LagGateMaxWait, "max wait for missing GTIDs; 0=never promote")
-	fs.DurationVar(&c.FenceGrace, "fence-grace", c.FenceGrace, "grace before fencing marked sole writer")
-	fs.DurationVar(&c.ReadOnlyGrace, "read-only-grace", c.ReadOnlyGrace, "reachable primary read-only this long counts as failed: restored if its GTIDs include every peer's, else failover")
-	fs.DurationVar(&c.ReplicaStale, "replica-stale", c.ReplicaStale, "heartbeat and last-queued trx stale threshold")
-	fs.StringVar((*string)(&c.ProxySQLMode), "proxysql-mode", envOr("PROXYSQL_MODE", "monitor"), "monitor or admin")
-	fs.StringVar(&c.ProxySQLAdminDSN, "proxysql-admin-dsn", envOr("PROXYSQL_ADMIN_DSN", ""), "ProxySQL admin DSN")
-	fs.BoolVar(&c.ProxySQLAdminEnable, "proxysql-admin-enable", envBool("PROXYSQL_ADMIN_ENABLE", false), "apply ProxySQL admin hostgroup updates on promote/fence")
-	fs.IntVar(&c.ProxySQLWriterHG, "proxysql-writer-hg", c.ProxySQLWriterHG, "writer hostgroup id")
-	fs.IntVar(&c.ProxySQLReaderHG, "proxysql-reader-hg", c.ProxySQLReaderHG, "reader hostgroup id")
-	fs.StringVar(&c.NtfyURL, "ntfy-url", envOr("NTFY_URL", ""), "ntfy topic URL for alerts")
-	fs.DurationVar(&c.StallAfter, "stall-after", envDuration("STALL_AFTER", c.StallAfter), "replica with threads ON whose GTID gap to the writer does not shrink for this long is stalled (alert, warning check, never a promotion candidate)")
-	fs.Float64Var(&c.ReplLagAlertSec, "repl-lag-alert-sec", c.ReplLagAlertSec, "replication lag alert threshold")
-	c.ReplThreadAlertDelay = envDuration("REPL_ALERT_DELAY", envDuration("REPL_THREAD_ALERT_DELAY", c.ReplThreadAlertDelay))
-	fs.DurationVar(&c.ReplThreadAlertDelay, "repl-alert-delay", c.ReplThreadAlertDelay, "replication-health alerts (thread stopped, read_only drift, primary read_only, lag, stall, unknown) are raised only after persisting this long and outside a switchover/failover window")
-	fs.DurationVar(&c.FenceFollowupWindow, "fence-followup-window", envDuration("FENCE_FOLLOWUP_WINDOW", c.FenceFollowupWindow), "after a failover, the fenced old primary waiting to rejoin is fenced without a separate alert and its replication-health alerts are held for this long; past it they alert once")
-	fs.DurationVar(&c.ReplThreadAlertDelay, "repl-thread-alert-delay", c.ReplThreadAlertDelay, "deprecated alias of -repl-alert-delay (v0.3.2)")
-	fs.StringVar(&c.ConsulServiceID, "consul-service-id", envOr("CONSUL_SERVICE_ID", ""), "register this agent service id and publish TTL checks (recommended)")
-	fs.StringVar(&c.ConsulServiceName, "consul-service-name", envOr("CONSUL_SERVICE_NAME", c.ConsulServiceName), "Consul service name when registering")
-	fs.StringVar(&proxysqlPeers, "proxysql-peer-endpoints", envOr("PROXYSQL_PEER_ENDPOINTS", ""), "peer=host:port map for ProxySQL mysql_servers matching (comma-separated)")
-	fs.StringVar(&mysqlPeers, "mysql-peer-endpoints", envOr("MYSQL_PEER_ENDPOINTS", ""), "peer=host:port map for remote MySQL admin (comma-separated)")
-	fs.BoolVar(&c.MySQLTLS, "mysql-tls", envBool("MYSQL_TLS", false), "enable TLS for peer MySQL connections")
-	fs.StringVar(&c.MySQLCAFile, "mysql-ca-file", envOr("MYSQL_CA_FILE", ""), "CA PEM for peer MySQL TLS")
-	fs.IntVar(&c.ActionLogMax, "action-log-max", c.ActionLogMax, "max entries in Consul action log KV")
-
-	fs.StringVar(&c.MasterFormat, "master-format", envOr("MASTER_FORMAT", "epoch"), "mysql/master/<cluster> write format: epoch (node|epoch) or legacy (host:port, epoch in writer/epoch); reads accept both")
-	fs.StringVar(&c.WriterServiceName, "writer-service", envOr("WRITER_SERVICE", ""), "Consul catalog service kept pointing at the writer (e.g. <cluster>-writer); empty = off")
-	fs.StringVar(&writerTags, "writer-service-tags", envOr("WRITER_SERVICE_TAGS", "mysql,writer"), "comma-separated tags for -writer-service")
-	fs.BoolVar(&c.ProxySQLVerify, "proxysql-verify", envBool("PROXYSQL_VERIFY", false), "read-only: compare ProxySQL runtime writer hostgroup with the writer key via -proxysql-admin-dsn and alert on mismatch (no ProxySQL writes)")
-	fs.DurationVar(&c.ProxySQLVerifyGrace, "proxysql-verify-grace", envDuration("PROXYSQL_VERIFY_GRACE", 20*time.Second), "mismatch must persist this long before the alert")
-	fs.BoolVar(&c.ForeignWriteAlert, "foreign-write-alert", envBool("FOREIGN_WRITE_ALERT", true), "alert when the master key was changed by something other than a guard (repman/bash post-script)")
-	fs.StringVar(&c.NtfyTokenFile, "ntfy-token-file", envOr("NTFY_TOKEN_FILE", ""), "optional ntfy access token file (Authorization: Bearer)")
-
+	raw := &rawFlags{}
+	defineFlags(fs, c, raw)
+	peers, writerTags, proxysqlPeers, mysqlPeers := "", "", "", ""
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
 
+	peers, writerTags, proxysqlPeers, mysqlPeers = raw.peers, raw.writerTags, raw.proxysqlPeers, raw.mysqlPeers
 	c.Peers = splitCSV(peers)
 	c.WriterServiceTags = splitCSV(writerTags)
 	if c.MasterFormat != "epoch" && c.MasterFormat != "legacy" {
@@ -393,4 +343,90 @@ func (c *Config) CatchupTimeout() time.Duration {
 		return 2 * c.MaxApplyLag
 	}
 	return 60 * time.Second
+}
+
+// rawFlags holds flag values that Load post-processes.
+type rawFlags struct {
+	peers, writerTags, proxysqlPeers, mysqlPeers string
+}
+
+// defineFlags registers every guard flag on fs. It is shared by Load and by
+// the subcommand argument splitter (to know which flags are booleans).
+func defineFlags(fs *flag.FlagSet, c *Config, raw *rawFlags) {
+	fs.StringVar(&c.NodeName, "node", envOr("GUARD_NODE", ""), "this node's logical name")
+	fs.StringVar((*string)(&c.Role), "role", envOr("GUARD_ROLE", "db"), "db or witness")
+	fs.StringVar((*string)(&c.Mode), "mode", envOr("GUARD_MODE", "observe"), "observe, fence, or act")
+	fs.StringVar(&c.MySQLDSN, "mysql-dsn", envOr("MYSQL_DSN", ""), "full MySQL DSN override (must not include password if -mysql-password-file is set)")
+	fs.StringVar(&c.MySQLHost, "mysql-host", envOr("MYSQL_HOST", "127.0.0.1"), "MySQL host when building DSN from -mysql-user")
+	fs.IntVar(&c.MySQLPort, "mysql-port", envInt("MYSQL_PORT", c.MySQLPort), "MySQL port when building DSN (env MYSQL_PORT)")
+	fs.StringVar(&c.MySQLReplUser, "mysql-repl-user", envOr("MYSQL_REPL_USER", ""), "replication account for CHANGE REPLICATION SOURCE (default: -mysql-user)")
+	fs.StringVar(&c.MySQLReplPassFile, "mysql-repl-password-file", envOr("MYSQL_REPL_PASSWORD_FILE", ""), "file containing the replication account password")
+	fs.DurationVar(&c.ReplStmtTimeout, "repl-stmt-timeout", envDuration("REPL_STMT_TIMEOUT", c.ReplStmtTimeout), "timeout for replication statements (CHANGE SOURCE, START/STOP/RESET REPLICA) and their connection pool")
+	fs.DurationVar(&c.ReplConnectTimeout, "repl-connect-timeout", envDuration("REPL_CONNECT_TIMEOUT", c.ReplConnectTimeout), "max wait for re-pointed replica IO+SQL threads ON")
+	fs.StringVar(&c.MySQLAdminUser, "mysql-user", envOr("MYSQL_USER", ""), "MySQL admin user")
+	fs.StringVar(&c.MySQLAdminPassFile, "mysql-password-file", envOr("MYSQL_PASSWORD_FILE", ""), "file containing MySQL password")
+	fs.StringVar(&c.ConsulAddr, "consul-addr", envOr("CONSUL_HTTP_ADDR", c.ConsulAddr), "Consul HTTP address")
+	fs.StringVar(&c.ConsulTokenFile, "consul-token-file", envOr("CONSUL_TOKEN_FILE", ""), "Consul ACL token file")
+	fs.StringVar(&c.ClusterName, "cluster", envOr("GUARD_CLUSTER", ""), "cluster name for KV keys (required)")
+	fs.StringVar(&raw.peers, "peers", envOr("GUARD_PEERS", ""), "comma-separated db peer names (required)")
+	fs.StringVar(&c.HTTPListen, "http", envOr("GUARD_HTTP", c.HTTPListen), "HTTP listen address")
+	fs.DurationVar(&c.Interval, "interval", c.Interval, "health loop interval")
+	fs.DurationVar(&c.ProbeTimeout, "probe-timeout", c.ProbeTimeout, "per-probe deadline")
+	fs.IntVar(&c.SlowThreshold, "slow-threshold", c.SlowThreshold, "consecutive slow probes before failed")
+	fs.DurationVar(&c.DeadAfter, "dead-after", c.DeadAfter, "time since first failure before vote counts dead")
+	fs.IntVar(&c.VotesNeeded, "votes-needed", c.VotesNeeded, "dead votes required (voters: each db guard, the witness connect check, and the replica IO vote; see README Quorum)")
+	fs.DurationVar(&c.SessionTTL, "session-ttl", c.SessionTTL, "Consul session TTL")
+	fs.DurationVar(&c.LockDelay, "lock-delay", c.LockDelay, "Consul lock delay")
+	fs.DurationVar(&c.MinBetweenFail, "min-between-failovers", c.MinBetweenFail, "rate limit between failovers")
+	fs.DurationVar(&c.MaxApplyLag, "max-apply-lag", c.MaxApplyLag, "allowed time to apply retrieved GTIDs")
+	fs.DurationVar(&c.FenceDrainTimeout, "fence-drain-timeout", envDuration("FENCE_DRAIN_TIMEOUT", c.FenceDrainTimeout), "switchover: wait for open transactions on the fenced source, then kill them")
+	fs.DurationVar(&c.SwitchoverCatchupTimeout, "switchover-catchup-timeout", envDuration("SWITCHOVER_CATCHUP_TIMEOUT", c.SwitchoverCatchupTimeout), "switchover: max wait for the target to apply the fenced source's final GTID set (0 = 2x max-apply-lag); on timeout the source is made writable again, epoch unchanged")
+	fs.DurationVar(&c.LagGateMaxWait, "lag-gate-max-wait", c.LagGateMaxWait, "max wait for missing GTIDs; 0=never promote")
+	fs.Func("fence-grace", "removed in v0.3.6 (was never used); accepted and ignored so old job files still start", func(string) error { return nil })
+	fs.DurationVar(&c.ReadOnlyGrace, "read-only-grace", c.ReadOnlyGrace, "reachable primary read-only this long counts as failed: restored if its GTIDs include every peer's, else failover")
+	fs.DurationVar(&c.ReplicaStale, "replica-stale", c.ReplicaStale, "replica IO vote: the IO thread has lost the primary when it is connecting/erroring or has received no event or heartbeat for this long (set SOURCE_HEARTBEAT_PERIOD well below it)")
+	fs.StringVar((*string)(&c.ProxySQLMode), "proxysql-mode", envOr("PROXYSQL_MODE", "monitor"), "monitor or admin")
+	fs.StringVar(&c.ProxySQLAdminDSN, "proxysql-admin-dsn", envOr("PROXYSQL_ADMIN_DSN", ""), "ProxySQL admin DSN")
+	fs.BoolVar(&c.ProxySQLAdminEnable, "proxysql-admin-enable", envBool("PROXYSQL_ADMIN_ENABLE", false), "apply ProxySQL admin hostgroup updates on promote/fence")
+	fs.IntVar(&c.ProxySQLWriterHG, "proxysql-writer-hg", c.ProxySQLWriterHG, "writer hostgroup id")
+	fs.IntVar(&c.ProxySQLReaderHG, "proxysql-reader-hg", c.ProxySQLReaderHG, "reader hostgroup id")
+	fs.StringVar(&c.NtfyURL, "ntfy-url", envOr("NTFY_URL", ""), "ntfy topic URL for alerts")
+	fs.DurationVar(&c.StallAfter, "stall-after", envDuration("STALL_AFTER", c.StallAfter), "replica with threads ON whose GTID gap to the writer does not shrink for this long is stalled (alert, warning check, never a promotion candidate)")
+	fs.Float64Var(&c.ReplLagAlertSec, "repl-lag-alert-sec", c.ReplLagAlertSec, "replication lag alert threshold")
+	c.ReplThreadAlertDelay = envDuration("REPL_ALERT_DELAY", envDuration("REPL_THREAD_ALERT_DELAY", c.ReplThreadAlertDelay))
+	fs.DurationVar(&c.ReplThreadAlertDelay, "repl-alert-delay", c.ReplThreadAlertDelay, "replication-health alerts (thread stopped, read_only drift, primary read_only, lag, stall, unknown) are raised only after persisting this long and outside a switchover/failover window")
+	fs.DurationVar(&c.FenceFollowupWindow, "fence-followup-window", envDuration("FENCE_FOLLOWUP_WINDOW", c.FenceFollowupWindow), "after a failover, the fenced old primary waiting to rejoin is fenced without a separate alert and its replication-health alerts are held for this long; past it they alert once")
+	fs.DurationVar(&c.ReplThreadAlertDelay, "repl-thread-alert-delay", c.ReplThreadAlertDelay, "deprecated alias of -repl-alert-delay (v0.3.2)")
+	fs.StringVar(&c.ConsulServiceID, "consul-service-id", envOr("CONSUL_SERVICE_ID", ""), "register this agent service id and publish TTL checks (recommended)")
+	fs.StringVar(&c.ConsulServiceName, "consul-service-name", envOr("CONSUL_SERVICE_NAME", c.ConsulServiceName), "Consul service name when registering")
+	fs.StringVar(&raw.proxysqlPeers, "proxysql-peer-endpoints", envOr("PROXYSQL_PEER_ENDPOINTS", ""), "peer=host:port map for ProxySQL mysql_servers matching (comma-separated)")
+	fs.StringVar(&raw.mysqlPeers, "mysql-peer-endpoints", envOr("MYSQL_PEER_ENDPOINTS", ""), "peer=host:port map for remote MySQL admin (comma-separated)")
+	fs.BoolVar(&c.MySQLTLS, "mysql-tls", envBool("MYSQL_TLS", false), "enable TLS for peer MySQL connections")
+	fs.StringVar(&c.MySQLCAFile, "mysql-ca-file", envOr("MYSQL_CA_FILE", ""), "CA PEM for peer MySQL TLS")
+	fs.IntVar(&c.ActionLogMax, "action-log-max", c.ActionLogMax, "max entries in Consul action log KV")
+
+	fs.StringVar(&c.MasterFormat, "master-format", envOr("MASTER_FORMAT", "epoch"), "mysql/master/<cluster> write format: epoch (node|epoch) or legacy (host:port, epoch in writer/epoch); reads accept both")
+	fs.StringVar(&c.MemberServiceName, "member-service", envOr("MEMBER_SERVICE", ""), "Consul catalog service with one entry per member on vnode <svc>-<node>-vnode, tagged writer/reader/lagging/fenced with a check <svc>:<node>:mysql (act mode only); empty = off")
+	fs.Float64Var(&c.MemberMaxLag, "member-max-lag", envFloat("MEMBER_MAX_LAG", 30), "member service: a replica lagging more seconds than this is tagged lagging (check warning) instead of reader")
+	fs.DurationVar(&c.MemberCheckDelay, "member-check-delay", envDuration("MEMBER_CHECK_DELAY", 10*time.Second), "member service: a role/check change must persist this long before it is written (anti-flap); promotions and fencing are immediate")
+	fs.StringVar(&c.WriterServiceName, "writer-service", envOr("WRITER_SERVICE", ""), "Consul catalog service kept pointing at the writer (e.g. <cluster>-writer); empty = off")
+	fs.StringVar(&raw.writerTags, "writer-service-tags", envOr("WRITER_SERVICE_TAGS", "mysql,writer"), "comma-separated tags for -writer-service")
+	fs.BoolVar(&c.ProxySQLVerify, "proxysql-verify", envBool("PROXYSQL_VERIFY", false), "read-only: compare ProxySQL runtime writer hostgroup with the writer key via -proxysql-admin-dsn and alert on mismatch (no ProxySQL writes)")
+	fs.DurationVar(&c.ProxySQLVerifyGrace, "proxysql-verify-grace", envDuration("PROXYSQL_VERIFY_GRACE", 20*time.Second), "mismatch must persist this long before the alert")
+	fs.BoolVar(&c.ForeignWriteAlert, "foreign-write-alert", envBool("FOREIGN_WRITE_ALERT", true), "alert when the master key was changed by something other than a guard (repman/bash post-script)")
+	fs.BoolVar(&c.WitnessProbe, "witness-probe", envBool("WITNESS_PROBE", true), "witness: probe the primary with a MySQL connect check and vote (needs -mysql-user/-mysql-password-file and -mysql-peer-endpoints; without them the witness never votes)")
+	fs.BoolVar(&c.SemiSyncGate, "semisync-gate", envBool("SEMISYNC_GATE", true), "refuse automatic failover when semi-sync is enabled on the primary but was last seen async (acknowledged writes could be lost)")
+	fs.BoolVar(&c.SemiSyncRestore, "semisync-restore", envBool("SEMISYNC_RESTORE", true), "after failover/switchover/rejoin, re-enable semi-sync source/replica settings when they were enabled before")
+	fs.BoolVar(&c.ReplSourceSSL, "repl-source-ssl", envBool("REPL_SOURCE_SSL", true), "CHANGE REPLICATION SOURCE uses SOURCE_SSL=1")
+	fs.StringVar(&c.NtfyTokenFile, "ntfy-token-file", envOr("NTFY_TOKEN_FILE", ""), "optional ntfy access token file (Authorization: Bearer)")
+
+}
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
 }

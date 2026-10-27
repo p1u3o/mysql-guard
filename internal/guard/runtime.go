@@ -67,6 +67,7 @@ type Runtime struct {
 	selfSemi     string
 	semi         semiSample // last sample of the primary's semi-sync state
 	semiBlocked  string     // primary|epoch already alerted as blocked by the semi-sync gate
+	semiBlockAt  time.Time  // last tick the semi-sync gate blocked a failover
 	quorum       Quorum
 	members      *memberDebounce
 	memberErr    string
@@ -247,7 +248,9 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 			r.mu.RLock()
 			replSt.StallReason, replSt.Stalled = r.stalled[r.cfg.NodeName], r.stalled[r.cfg.NodeName] != ""
 			r.mu.RUnlock()
-			r.exec.PublishReplicationAlerts(ctx, replSt)
+			if !r.gateHolding(primary, epochKV) {
+				r.exec.PublishReplicationAlerts(ctx, replSt)
+			}
 		}
 	}
 

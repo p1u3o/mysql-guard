@@ -89,12 +89,24 @@ func (r *Runtime) semiSyncGate(ctx context.Context, primary string, epoch uint64
 	r.mu.Lock()
 	first := r.semiBlocked != key
 	r.semiBlocked = key
+	r.semiBlockAt = time.Now()
 	r.mu.Unlock()
 	if first {
 		r.exec.Alert(ctx, "failover_blocked", msg, true)
 	}
 	r.setDecision("blocked: semi-sync gate (" + note + ")")
 	return note, false
+}
+
+// gateHolding: while the semi-sync gate is blocking the failover of primary,
+// the replica-side symptoms of that dead primary (repl_* and
+// proxysql_writer_mismatch) are the same event as failover_blocked and are
+// held, so the event sends exactly one alert.
+func (r *Runtime) gateHolding(primary string, epoch uint64) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.semiBlocked == fmt.Sprintf("%s|%d", primary, epoch) &&
+		time.Since(r.semiBlockAt) <= VoteMaxAge(r.cfg.Interval, r.cfg.ProbeTimeout)
 }
 
 // ---- witness connect check (v0.3.6) ----

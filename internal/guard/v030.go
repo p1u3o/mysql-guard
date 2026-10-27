@@ -81,7 +81,7 @@ func (r *Runtime) v030Checks(ctx context.Context, now time.Time, maint bool, pri
 			r.pxSince = time.Time{}
 			return
 		}
-		if msg != "" && r.gateHolding(primary, epoch) {
+		if msg != "" && (r.gateHolding(primary, epoch) || r.recoveryHolding(time.Now())) {
 			r.pxSince = time.Time{}
 			return
 		}

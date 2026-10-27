@@ -39,6 +39,9 @@ type Executor struct {
 }
 
 func NewExecutor(cfg *config.Config, log *slog.Logger, my *mysql.Prober, peers *mysql.Pool, px *proxysql.Client, store *consul.Store, alerts *notify.Fanout) *Executor {
+	if cfg != nil && cfg.FenceFollowupWindow > 0 {
+		FenceFollowupWindow = cfg.FenceFollowupWindow
+	}
 	return &Executor{
 		cfg:       cfg,
 		log:       log,
@@ -151,7 +154,7 @@ func (e *Executor) PublishReplicationAlerts(ctx context.Context, st replhealth.S
 	held := false
 	for _, a := range alerts {
 		if isThreadCode(a.Code) {
-			held = e.transitionHeld(ctx)
+			held = e.transitionHeld(ctx) || e.fencedFollowupHeld(ctx, st.Node)
 			break
 		}
 	}

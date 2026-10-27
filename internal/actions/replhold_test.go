@@ -75,3 +75,38 @@ func TestFailoverFollowup(t *testing.T) {
 		t.Fatal("switchover ended 30s ago: want alert")
 	}
 }
+
+// v0.3.4: the fenced old primary of a failover holds its replication-health
+// alerts for FenceFollowupWindow, then alerts once.
+func TestFencedFollowupReplHold(t *testing.T) {
+	now := time.Now()
+	f := &consul.Transition{Action: "failover", From: "a", To: "b", Started: now.Add(-70 * time.Second), Ended: now.Add(-60 * time.Second)}
+	fs := map[string]time.Time{}
+	al := []replhealth.Alert{{Code: "repl_io_stopped"}, {Code: "repl_sql_stopped"}}
+	// 60s..29m after the failover: held even though delay+grace passed.
+	for _, d := range []time.Duration{0, 5 * time.Minute, 28 * time.Minute, 29*time.Minute - time.Second} {
+		at := now.Add(d)
+		held := TransitionActive(f, at) || failoverFollowup(f, "a", at)
+		if !held {
+			t.Fatalf("+%v: want held", d)
+		}
+		if got := filterThreadAlerts(al, fs, held, 45*time.Second, at); len(got) != 0 {
+			t.Fatalf("+%v: %v", d, got)
+		}
+	}
+	// other node is not held by the follow-up rule
+	if failoverFollowup(f, "b", now.Add(5*time.Minute)) {
+		t.Fatal("new primary must not be held")
+	}
+	// past the window: alerts after the delay (dedup makes it once)
+	at := now.Add(29*time.Minute + time.Second)
+	if failoverFollowup(f, "a", at) {
+		t.Fatal("past window: want not held")
+	}
+	if got := filterThreadAlerts(al, fs, false, 45*time.Second, at); len(got) != 0 {
+		t.Fatalf("delay restarts after the window: %v", got)
+	}
+	if got := filterThreadAlerts(al, fs, false, 45*time.Second, at.Add(46*time.Second)); len(got) != 2 {
+		t.Fatalf("past window+delay: want alert, got %v", got)
+	}
+}

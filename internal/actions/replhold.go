@@ -97,8 +97,25 @@ func (e *Executor) markTransition(ctx context.Context, action, from, to string) 
 
 // FenceFollowupWindow: a returning old primary of a failover that ended less
 // than this long ago is fenced without a separate alert (the failover alert
-// already reported it dead); the fence is still action-logged.
-const FenceFollowupWindow = 30 * time.Minute
+// already reported it dead); the fence is still action-logged. Since v0.3.4 the
+// same node's replication-health alerts (threads stopped, read_only, lag, ...)
+// are also held for this window while it waits to be rejoined; if it is still
+// unhealthy after the window they alert once (after ReplThreadAlertDelay).
+// Overridable via -fence-followup-window (config.FenceFollowupWindow).
+var FenceFollowupWindow = 30 * time.Minute
+
+// fencedFollowupHeld reports whether node is the fenced old primary of a recent
+// failover (within FenceFollowupWindow), whose replication-health alerts are held.
+func (e *Executor) fencedFollowupHeld(ctx context.Context, node string) bool {
+	if e.store == nil || node == "" {
+		return false
+	}
+	t, err := e.store.GetTransition(ctx)
+	if err != nil {
+		return false
+	}
+	return failoverFollowup(t, node, time.Now())
+}
 
 func (e *Executor) fenceIsFailoverFollowup(ctx context.Context, node string) bool {
 	if e.store == nil {

@@ -93,6 +93,7 @@ type Config struct {
 	NtfyURL              string
 	ReplLagAlertSec      float64
 	ReplThreadAlertDelay time.Duration
+	FenceFollowupWindow  time.Duration
 	StallAfter           time.Duration
 	ConsulServiceID      string
 	ConsulServiceName    string
@@ -166,6 +167,7 @@ func Load(args []string) (*Config, error) {
 		ProxySQLReaderHG:     11,
 		ReplLagAlertSec:      30,
 		ReplThreadAlertDelay: 45 * time.Second,
+		FenceFollowupWindow:  30 * time.Minute,
 		StallAfter:           30 * time.Second,
 		HTTPListen:           ":9470",
 		ConsulAddr:           "127.0.0.1:8500",
@@ -222,6 +224,7 @@ func Load(args []string) (*Config, error) {
 	fs.Float64Var(&c.ReplLagAlertSec, "repl-lag-alert-sec", c.ReplLagAlertSec, "replication lag alert threshold")
 	c.ReplThreadAlertDelay = envDuration("REPL_ALERT_DELAY", envDuration("REPL_THREAD_ALERT_DELAY", c.ReplThreadAlertDelay))
 	fs.DurationVar(&c.ReplThreadAlertDelay, "repl-alert-delay", c.ReplThreadAlertDelay, "replication-health alerts (thread stopped, read_only drift, primary read_only, lag, stall, unknown) are raised only after persisting this long and outside a switchover/failover window")
+	fs.DurationVar(&c.FenceFollowupWindow, "fence-followup-window", envDuration("FENCE_FOLLOWUP_WINDOW", c.FenceFollowupWindow), "after a failover, the fenced old primary waiting to rejoin is fenced without a separate alert and its replication-health alerts are held for this long; past it they alert once")
 	fs.DurationVar(&c.ReplThreadAlertDelay, "repl-thread-alert-delay", c.ReplThreadAlertDelay, "deprecated alias of -repl-alert-delay (v0.3.2)")
 	fs.StringVar(&c.ConsulServiceID, "consul-service-id", envOr("CONSUL_SERVICE_ID", ""), "register this agent service id and publish TTL checks (recommended)")
 	fs.StringVar(&c.ConsulServiceName, "consul-service-name", envOr("CONSUL_SERVICE_NAME", c.ConsulServiceName), "Consul service name when registering")

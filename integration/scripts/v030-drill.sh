@@ -347,6 +347,51 @@ docker compose exec -T consul consul kv delete mysql/example/guard/maintenance >
 writes_through_proxysql_land_on db-a v11c; wait_for 30 "GTIDs match" gtids_match
 pass "V11c: persistent read-only primary alerted once after the delay, no action under maintenance"
 
+log "=== V12 (v0.3.4): kill primary, old primary left fenced: one failover alert, held in the window, then alerts once ==="
+primary_is db-a || fail "precondition primary db-a"
+wait_for 30 "GTIDs match before V12 kill" gtids_match
+FFW_S=180
+ev_begin
+docker compose stop db-a
+wait_for 90 "V12 failover to db-b" primary_is db-b
+two_writers && fail "TWO WRITERS after V12 failover"
+master_is db-b:3306 || fail "V12 key $(master)"
+wait_for 20 "V12 writer service -> db-b:3306" svc_is db-b:3306
+writes_through_proxysql_land_on db-b v12
+docker compose start db-a
+wait_for 120 "V12 db-a back" sh -c "docker compose exec -T db-a mysqladmin ping -h 127.0.0.1 -pplaceholder --silent"
+wait_for 60 "V12 db-a fenced read-only" sh -c "[ \"\$(docker compose exec -T db-a mysql -uroot -pplaceholder -N -B -e 'SELECT CONCAT(@@global.read_only,@@global.super_read_only)' 2>/dev/null)\" = 11 ]"
+replica_running db-a && fail "V12 precondition: db-a should not be replicating before rejoin"
+TEND=$(kv mysql/example/guard/transition | jq -r '.ended | sub("\\.[0-9]+";"") | fromdate')
+[ "$(kv mysql/example/guard/transition | jq -r .action)" = failover ] || fail "V12 transition marker not failover"
+# V12a: well past delay+grace (70s) but inside the window: exactly one failover alert, nothing for db-a.
+W=$(( TEND + 90 - $(date +%s) )); [ "$W" -gt 0 ] && sleep "$W"
+[ "$(date +%s)" -lt $(( TEND + FFW_S - 10 )) ] || fail "V12a check ran outside the window"
+EV_WAIT=0 ev_check "V12a (kill, fenced, in window)" failover
+two_writers && fail "TWO WRITERS in V12 window"
+# V12b: past window + delay + margin: the fenced node's replication alerts arrive once.
+ev_begin
+W=$(( TEND + FFW_S + 45 + 25 - $(date +%s) )); [ "$W" -gt 0 ] && sleep "$W"
+NEW=$(alerts | tail -n +$((EVN+1)) | sed 's/^mysql-guard example: //' | sort)
+[ -n "$NEW" ] || fail "V12b: fenced node past the window did not alert"
+[ -z "$(echo "$NEW" | grep -vxE 'repl_io_stopped|repl_sql_stopped|read_only_drift|repl_state_unknown|repl_lag|repl_stalled')" ] || fail "V12b: unexpected alerts [$NEW]"
+[ -z "$(echo "$NEW" | uniq -d)" ] || fail "V12b: duplicate alerts [$NEW]"
+N1=$(alerts | wc -l | tr -d ' '); sleep 30
+[ "$(alerts | wc -l | tr -d ' ')" = "$N1" ] || fail "V12b: fenced node alerted more than once"
+log "V12b: past-window alerts exactly once: [$(echo $NEW)]"
+# restore: rejoin db-a, switch back, no extra alert from the rejoin
+ev_begin
+docker compose exec -T guard-b mysql-guard rejoin db-b --node=db-a --mysql-host=db-a "${FLAGS[@]}" || fail "V12 rejoin db-a"
+wait_for 30 "V12 db-a replicating" replica_running db-a
+wait_for 30 "v12 on db-a" row_on db-a v12; wait_for 30 "V12 GTIDs match" gtids_match
+sleep 22
+docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "V12 switch back to db-a"
+wait_for 20 "V12 primary db-a" primary_is db-a
+wait_for 20 "V12 writer service -> db-a:3306" svc_is db-a:3306
+writes_through_proxysql_land_on db-a v12b
+ev_check "V12c (rejoin+switchback)" switchover
+pass "V12: kill-primary gave one failover alert and nothing for the fenced node in the window; past the window it alerted once; rejoin silent"
+
 SK=$(count_skipped); [ "$SK" = 0 ] || fail "$SK skipped action entries"
 two_writers && fail "TWO WRITERS at end"
 log "alerts delivered: $(alerts | sort | uniq -c | tr '\n' ';')"

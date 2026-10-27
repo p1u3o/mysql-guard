@@ -23,6 +23,7 @@ services:
       MYSQL_REPL_PASSWORD: placeholder
       REPL_CONNECT_TIMEOUT: 15s
       GUARD_MODE: ${GMODE:-observe}
+      FENCE_FOLLOWUP_WINDOW: ${FFW:-180s}
       PROXYSQL_ADMIN_DSN: "radmin:placeholder@tcp(proxysql:6032)/"
     command:
       - --node=db-a
@@ -55,6 +56,7 @@ services:
       MYSQL_REPL_PASSWORD: placeholder
       REPL_CONNECT_TIMEOUT: 15s
       GUARD_MODE: ${GMODE:-observe}
+      FENCE_FOLLOWUP_WINDOW: ${FFW:-180s}
       PROXYSQL_ADMIN_DSN: "radmin:placeholder@tcp(proxysql:6032)/"
     command:
       - --node=db-b
@@ -87,6 +89,7 @@ services:
       MYSQL_REPL_PASSWORD: placeholder
       REPL_CONNECT_TIMEOUT: 15s
       GUARD_MODE: ${GMODE:-observe}
+      FENCE_FOLLOWUP_WINDOW: ${FFW:-180s}
       PROXYSQL_ADMIN_DSN: "radmin:placeholder@tcp(proxysql:6032)/"
     command:
       - --node=witness-1

@@ -243,8 +243,62 @@ sleep 8; primary_is db-a || fail "primary not db-a after foreign write drill"
 [ "$(ro db-b)" = 11 ] || fail "db-b writable after foreign write"
 pass "V8: foreign write alerted and cleared, no action taken under maintenance"
 
+log "=== V9: switchover under continuous writes (both ways, v0.3.1 fence/catch-up) ==="
+LOADTAB="CREATE TABLE IF NOT EXISTS drill.load (id BIGINT AUTO_INCREMENT PRIMARY KEY, tag VARCHAR(16), ts TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3))"
+px "$LOADTAB" || sqlq db-a "$LOADTAB"
+load_start() { # 3 writer loops, single-row commits through ProxySQL (target 20-50/s total)
+  for i in 1 2 3; do
+    docker compose exec -T -d db-b bash -c "echo \$\$ >> /tmp/load.pid; while :; do mysql -h proxysql -P6033 -uroot -pplaceholder -N -B -e \"INSERT INTO drill.load (tag) VALUES ('$1')\" 2>/dev/null; sleep 0.1; done"
+  done
+  sleep 1
+}
+load_stop() { docker compose exec -T db-b bash -c 'kill $(cat /tmp/load.pid) 2>/dev/null; rm -f /tmp/load.pid' || true; }
+load_rate() { sqlq "$1" "SELECT ROUND(COUNT(*)/GREATEST(TIMESTAMPDIFF(MICROSECOND,MIN(ts),MAX(ts))/1e6,1),1) FROM drill.load WHERE tag='$2'"; }
+for dir in "db-a db-b guard-a" "db-b db-a guard-b"; do
+  set -- $dir; FROM=$1; TO=$2; G=$3; TAG="v9${TO#db-}"
+  E=$(kv_epoch); A=$(alert_n switchover); AB=$(alert_n switchover-aborted); ER=$(alert_n errant_gtid)
+  load_start "$TAG"; sleep 5
+  docker compose exec -T "$G" mysql-guard switchover "$TO" --node="$FROM" --mysql-host="$FROM" "${FLAGS[@]}" || { load_stop; fail "switchover $FROM->$TO under load"; }
+  sleep 5; load_stop
+  wait_for 20 "primary $TO" primary_is "$TO"
+  check_roles "$TO" "$FROM"
+  two_writers && fail "TWO WRITERS after switchover under load"
+  master_is "$TO:3306" || fail "key $(master)"; cur_is "$TO|$((E+1))" || fail "writer/current $(kv mysql/example/writer/current)"
+  wait_for 20 "writer service -> $TO:3306" svc_is "$TO:3306"
+  wait_for 20 "switchover alert" alert_gt switchover "$A"
+  [ "$(alert_n switchover-aborted)$(alert_n errant_gtid)" = "$AB$ER" ] || fail "abort/errant alert under load"
+  wait_for 30 "GTIDs match after load" gtids_match
+  RATE=$(load_rate "$TO" "$TAG"); N=$(sqlq "$TO" "SELECT COUNT(*) FROM drill.load WHERE tag='$TAG'")
+  [ "$(sqlq "$FROM" "SELECT COUNT(*) FROM drill.load WHERE tag='$TAG'")" = "$N" ] || fail "row count differs"
+  awk -v r="$RATE" 'BEGIN{exit !(r>=20 && r<=50)}' || fail "load rate $RATE/s outside 20-50"
+  writes_through_proxysql_land_on "$TO" "$TAG-after"
+  snap "v9-$FROM-$TO"
+  pass "V9: switchover $FROM->$TO under ~${RATE} writes/s ($N rows, identical on both), epoch $E->$(kv_epoch), no errant/abort alert"
+done
+
+log "=== V10: catch-up timeout -> clean abort, source writable, epoch unchanged ==="
+primary_is db-a || fail "precondition primary db-a"
+E=$(kv_epoch); AB=$(alert_n switchover-aborted); S=$(alert_n switchover)
+sqlq db-b "STOP REPLICA SQL_THREAD"
+write_row db-a v10-lag
+docker compose exec -T guard-a mysql-guard switchover db-b --node=db-a --mysql-host=db-a "${FLAGS[@]}" --switchover-catchup-timeout=3s && fail "switchover with lagging target reported success"
+check_roles db-a db-b
+two_writers && fail "TWO WRITERS after catch-up abort"
+[ "$(kv_epoch)" = "$E" ] || fail "epoch bumped by catch-up abort ($E -> $(kv_epoch))"
+master_is db-a:3306 || fail "key changed $(master)"; cur_is "db-a|$E" || fail "writer/current $(kv mysql/example/writer/current)"
+wait_for 20 "switchover-aborted alert" alert_gt switchover-aborted "$AB"
+[ "$(alert_n switchover-aborted)" = "$((AB+1))" ] || fail "expected exactly one abort alert"
+[ "$(alert_n switchover)" = "$S" ] || fail "switchover alert sent for aborted switchover"
+wait_for 20 "ProxySQL writer back to db-a" px_writer_is db-a
+writes_through_proxysql_land_on db-a v10-after
+sqlq db-b "START REPLICA SQL_THREAD"
+wait_for 30 "v10 rows on db-b" row_on db-b v10-after; wait_for 30 "GTIDs match" gtids_match
+sleep 8; primary_is db-a || fail "primary moved after abort"
+snap v10-catchup-abort
+pass "V10: catch-up timeout aborted cleanly: db-a writable, epoch $E unchanged, ProxySQL restored, one abort alert"
+
 SK=$(count_skipped); [ "$SK" = 0 ] || fail "$SK skipped action entries"
 two_writers && fail "TWO WRITERS at end"
 log "alerts delivered: $(alerts | sort | uniq -c | tr '\n' ';')"
-log "ALL V0.3.0 DRILLS PASSED"
+log "ALL V0.3.x DRILLS PASSED"
 docker compose ps

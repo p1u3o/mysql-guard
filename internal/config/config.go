@@ -67,24 +67,28 @@ type Config struct {
 
 	HTTPListen string
 
-	Interval            time.Duration
-	ProbeTimeout        time.Duration
-	SlowThreshold       int
-	DeadAfter           time.Duration
-	VotesNeeded         int
-	SessionTTL          time.Duration
-	LockDelay           time.Duration
-	MinBetweenFail      time.Duration
-	MaxApplyLag         time.Duration
-	LagGateMaxWait      time.Duration
-	FenceGrace          time.Duration
-	ReadOnlyGrace       time.Duration
-	ReplicaStale        time.Duration
-	ProxySQLMode        ProxySQLMode
-	ProxySQLAdminDSN    string
-	ProxySQLAdminEnable bool
-	ProxySQLWriterHG    int
-	ProxySQLReaderHG    int
+	Interval       time.Duration
+	ProbeTimeout   time.Duration
+	SlowThreshold  int
+	DeadAfter      time.Duration
+	VotesNeeded    int
+	SessionTTL     time.Duration
+	LockDelay      time.Duration
+	MinBetweenFail time.Duration
+	MaxApplyLag    time.Duration
+	// v0.3.1 switchover: drain wait for open transactions on the fenced source,
+	// and max wait for the target to reach the source's final GTID set.
+	FenceDrainTimeout        time.Duration
+	SwitchoverCatchupTimeout time.Duration
+	LagGateMaxWait           time.Duration
+	FenceGrace               time.Duration
+	ReadOnlyGrace            time.Duration
+	ReplicaStale             time.Duration
+	ProxySQLMode             ProxySQLMode
+	ProxySQLAdminDSN         string
+	ProxySQLAdminEnable      bool
+	ProxySQLWriterHG         int
+	ProxySQLReaderHG         int
 
 	NtfyURL           string
 	ReplLagAlertSec   float64
@@ -151,6 +155,7 @@ func Load(args []string) (*Config, error) {
 		LockDelay:          15 * time.Second,
 		MinBetweenFail:     time.Hour,
 		MaxApplyLag:        30 * time.Second,
+		FenceDrainTimeout:  3 * time.Second,
 		LagGateMaxWait:     0,
 		FenceGrace:         30 * time.Second,
 		ReadOnlyGrace:      10 * time.Second,
@@ -199,6 +204,8 @@ func Load(args []string) (*Config, error) {
 	fs.DurationVar(&c.LockDelay, "lock-delay", c.LockDelay, "Consul lock delay")
 	fs.DurationVar(&c.MinBetweenFail, "min-between-failovers", c.MinBetweenFail, "rate limit between failovers")
 	fs.DurationVar(&c.MaxApplyLag, "max-apply-lag", c.MaxApplyLag, "allowed time to apply retrieved GTIDs")
+	fs.DurationVar(&c.FenceDrainTimeout, "fence-drain-timeout", envDuration("FENCE_DRAIN_TIMEOUT", c.FenceDrainTimeout), "switchover: wait for open transactions on the fenced source, then kill them")
+	fs.DurationVar(&c.SwitchoverCatchupTimeout, "switchover-catchup-timeout", envDuration("SWITCHOVER_CATCHUP_TIMEOUT", c.SwitchoverCatchupTimeout), "switchover: max wait for the target to apply the fenced source's final GTID set (0 = 2x max-apply-lag); on timeout the source is made writable again, epoch unchanged")
 	fs.DurationVar(&c.LagGateMaxWait, "lag-gate-max-wait", c.LagGateMaxWait, "max wait for missing GTIDs; 0=never promote")
 	fs.DurationVar(&c.FenceGrace, "fence-grace", c.FenceGrace, "grace before fencing marked sole writer")
 	fs.DurationVar(&c.ReadOnlyGrace, "read-only-grace", c.ReadOnlyGrace, "reachable primary read-only this long counts as failed: restored if its GTIDs include every peer's, else failover")
@@ -367,4 +374,15 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// CatchupTimeout is the switchover catch-up limit (default 2x MaxApplyLag).
+func (c *Config) CatchupTimeout() time.Duration {
+	if c.SwitchoverCatchupTimeout > 0 {
+		return c.SwitchoverCatchupTimeout
+	}
+	if c.MaxApplyLag > 0 {
+		return 2 * c.MaxApplyLag
+	}
+	return 60 * time.Second
 }

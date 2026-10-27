@@ -30,3 +30,18 @@ func TestSwitchoverGTIDMismatch(t *testing.T) {
 		t.Fatal("expected mismatch error")
 	}
 }
+
+func TestSwitchoverGateAfterFence(t *testing.T) {
+	src := gtid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-86")
+	// replica applied a newer source write than an earlier snapshot: fine once
+	// the snapshot is the fenced final set (the v0.3.0 false "extra GTIDs").
+	if err := SwitchoverGate(src, gtid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-86")); err != nil {
+		t.Fatal(err)
+	}
+	if err := SwitchoverGate(src, gtid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-85")); err == nil {
+		t.Fatal("expected missing-GTID error")
+	}
+	if err := SwitchoverGate(src, gtid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-86,bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:1")); err == nil {
+		t.Fatal("expected errant error")
+	}
+}

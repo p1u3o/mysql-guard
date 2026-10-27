@@ -17,17 +17,10 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 		return fmt.Errorf("maintenance mode")
 	}
 	oldPrimary, newPrimary := mysql.ResolveOldNewPrimary(e.cfg, newPrimaryArg)
-	// The new primary must not hold transactions the old primary lacks; any lag
-	// is drained after the old primary is made read-only.
-	if extra := gtid.Subtract(peer, local); !extra.Empty() {
-		e.actionLog(ctx, 0, "switchover", "new primary has GTIDs missing on old primary: "+string(extra), "blocked", "precheck")
-		return fmt.Errorf("switchover blocked: target has extra GTIDs %s", extra)
-	}
-	if err := e.checkErrant(ctx, peer, local, "switchover"); err != nil {
-		e.actionLog(ctx, 0, "switchover", err.Error(), "blocked", "errant_gtid")
-		return err
-	}
-	e.actionLog(ctx, 0, "switchover", "starting", "ok", "begin")
+	// v0.3.1: no GTID comparison before the source is fenced. local/peer were
+	// read one after the other while the source still took writes, so a replica
+	// applying a newer source write between the two reads looked "errant".
+	_, _ = local, peer
 	if e.observe {
 		e.actionLog(ctx, 0, "switchover", "observe mode", "skipped", "end")
 		return fmt.Errorf("switchover refused: guard is in observe mode (writes nothing)")
@@ -43,6 +36,7 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 	if err != nil {
 		return err
 	}
+	e.actionLog(ctx, 0, "switchover", "starting", "ok", "begin")
 	rolled := false
 	rollback := func() {
 		if rolled {
@@ -51,29 +45,51 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 		rolled = true
 		_ = oldAdm.SetSuperReadOnly(ctx, false)
 		_ = e.proxy.ApplyPromote(ctx, oldPrimary, newPrimary)
-		e.actionLog(ctx, 0, "switchover", "pre-epoch rollback", "ok", "rollback")
+		e.actionLog(ctx, 0, "switchover", "pre-epoch rollback: "+oldPrimary+" writable again, epoch unchanged", "ok", "rollback")
 	}
+	abort := func(step string, cause error) error {
+		e.actionLog(ctx, 0, "switchover", cause.Error(), "error", step)
+		rollback()
+		e.Alert(ctx, "switchover-aborted", fmt.Sprintf("switchover %s -> %s aborted at %s (%s); %s writable again, epoch unchanged", oldPrimary, newPrimary, step, cause, oldPrimary), true)
+		return fmt.Errorf("switchover aborted at %s: %w", step, cause)
+	}
+	// 1. fence the source: super_read_only waits for in-progress commits; then
+	// drain (or kill) transactions still open so the final GTID set is stable.
 	if err := oldAdm.SetSuperReadOnly(ctx, true); err != nil {
 		e.actionLog(ctx, 0, "switchover", err.Error(), "error", "old_super_read_only")
+		rollback()
 		return err
 	}
 	e.actionLog(ctx, 0, "switchover", "old primary read-only", "ok", "old_super_read_only")
+	if killed, err := oldAdm.DrainTransactions(ctx, e.cfg.FenceDrainTimeout); err != nil {
+		return abort("drain_transactions", err)
+	} else if killed > 0 {
+		e.actionLog(ctx, 0, "switchover", fmt.Sprintf("killed %d open transaction(s) on %s after %s", killed, oldPrimary, e.cfg.FenceDrainTimeout), "warn", "drain_transactions")
+	}
 	if err := e.proxy.ApplyPromote(ctx, newPrimary, oldPrimary); err != nil {
-		e.actionLog(ctx, 0, "switchover", err.Error(), "error", "proxysql_offline_old")
-		rollback()
-		return err
+		return abort("proxysql_offline_old", err)
 	}
-	targetGTID, err := oldAdm.GTIDExecuted(ctx)
+	// 2. the source's final GTID set, read only after the fence.
+	finalSet, err := oldAdm.GTIDExecuted(ctx)
 	if err != nil {
-		e.actionLog(ctx, 0, "switchover", err.Error(), "error", "read_old_gtid")
+		return abort("read_old_gtid", err)
+	}
+	// 3. target catches up within the timeout, else clean abort (same epoch).
+	if err := newAdm.WaitExecuted(ctx, finalSet, e.cfg.CatchupTimeout()); err != nil {
+		return abort("catchup_timeout", err)
+	}
+	// 4. only now the errant check: target minus source must be empty.
+	targetSet, err := newAdm.GTIDExecuted(ctx)
+	if err != nil {
+		return abort("read_new_gtid", err)
+	}
+	if err := SwitchoverGate(finalSet, targetSet); err != nil {
+		e.actionLog(ctx, 0, "switchover", err.Error(), "blocked", "errant_gtid")
 		rollback()
+		e.Alert(ctx, "errant_gtid", fmt.Sprintf("switchover %s -> %s blocked: %s; %s writable again, epoch unchanged", oldPrimary, newPrimary, err, oldPrimary), true)
 		return err
 	}
-	if err := newAdm.WaitExecuted(ctx, targetGTID, e.cfg.MaxApplyLag*2); err != nil {
-		e.actionLog(ctx, 0, "switchover", err.Error(), "error", "wait_gtid")
-		rollback()
-		return err
-	}
+	e.actionLog(ctx, 0, "switchover", "target caught up to fenced source; no errant GTIDs", "ok", "gtid_gate")
 	if err := newAdm.StopReplica(ctx); err != nil {
 		e.actionLog(ctx, 0, "switchover", err.Error(), "error", "stop_replica")
 		rollback()
@@ -226,4 +242,16 @@ func (e *Executor) actionLog(ctx context.Context, epoch uint64, action, reason, 
 	if e.alog != nil {
 		e.alog.Log(ctx, epoch, action, reason, result, step)
 	}
+}
+
+// SwitchoverGate is the post-fence check: after catch-up the target must hold
+// every source GTID and nothing the fenced source lacks.
+func SwitchoverGate(final, target gtid.Set) error {
+	if missing := gtid.Subtract(final, target); !missing.Empty() {
+		return fmt.Errorf("target missing source GTIDs %s", missing)
+	}
+	if extra := gtid.Subtract(target, final); !extra.Empty() {
+		return fmt.Errorf("target has errant GTIDs %s", extra)
+	}
+	return nil
 }

@@ -299,3 +299,55 @@ func PurgedBlocksRejoin(sourcePurged, joinerExecuted, sourceExecuted gtid.Set) b
 	// joiner ahead of source executed — errant path should have caught this
 	return !gtid.Subtract(behind, sourcePurged).Empty()
 }
+
+// DrainTransactions waits up to timeout for open InnoDB transactions of other
+// client sessions to end (call after super_read_only=ON), then KILLs the
+// sessions still holding one. Returns how many were killed.
+func (a *Admin) DrainTransactions(ctx context.Context, timeout time.Duration) (int, error) {
+	if a.db == nil {
+		return 0, errors.New("no mysql connection")
+	}
+	const q = "SELECT t.trx_mysql_thread_id FROM information_schema.innodb_trx t " +
+		"JOIN performance_schema.threads p ON p.PROCESSLIST_ID = t.trx_mysql_thread_id " +
+		"WHERE p.TYPE = 'FOREGROUND' AND t.trx_mysql_thread_id <> CONNECTION_ID()"
+	open := func() ([]int64, error) {
+		rows, err := a.db.QueryContext(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return nil, err
+			}
+			ids = append(ids, id)
+		}
+		return ids, rows.Err()
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		ids, err := open()
+		if err != nil {
+			return 0, err
+		}
+		if len(ids) == 0 {
+			return 0, nil
+		}
+		if time.Now().After(deadline) {
+			n := 0
+			for _, id := range ids {
+				if err := a.exec(ctx, fmt.Sprintf("KILL %d", id)); err == nil {
+					n++
+				}
+			}
+			return n, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}

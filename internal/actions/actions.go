@@ -190,8 +190,10 @@ func (e *Executor) Alert(ctx context.Context, code, msg string, critical bool) {
 	if e.alerts != nil {
 		if err := e.alerts.Alert(ctx, code, msg, critical); err != nil {
 			e.log.Warn("alert delivery failed", "code", code, "err", err)
-		} else {
+		} else if e.alerts.Ntfy != nil {
 			e.log.Info("alert sent", "code", code)
+		} else {
+			e.log.Info("alert recorded (no ntfy URL; consul check only)", "code", code)
 		}
 	}
 }

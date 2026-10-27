@@ -40,6 +40,10 @@ Open `http://<listen>/` on the same `-http` address. The dashboard polls `/statu
 
 `-mysql-peer-endpoints` / `MYSQL_PEER_ENDPOINTS` (`db-a=host:port,db-b=host:port`) with shared `-mysql-user` and password file. Optional `-mysql-tls` and `-mysql-ca-file`. Switchover/rejoin and `/status` cluster view use these connections (local DSN remains fallback for this node).
 
+### Switchover ordering: fence, catch up, then check (v0.3.1)
+
+GTID sets are compared only after the old primary is fenced. Order: (1) `super_read_only=ON` on the old primary and offline it in ProxySQL; open transactions get `-fence-drain-timeout` (default 3s) to finish, then their sessions are killed; (2) read the old primary's final `gtid_executed`; (3) wait for the target to apply it within `-switchover-catchup-timeout` (default 2x `-max-apply-lag`); (4) errant check: target minus source must be empty, and source minus target must be empty. If catch-up times out or the check fails, the switchover aborts before the epoch bump: the old primary is made writable again, ProxySQL is restored, the epoch and master key are unchanged, and `switchover-aborted` (or `errant_gtid`) is alerted. v0.3.0 compared snapshots read before the fence, so under writes a replica that applied a newer source transaction between the two reads was wrongly reported as having extra GTIDs. Failover is not affected: its gate reads only the candidate (received vs executed) and the dead primary takes no writes; the superset gate against the last published writer GTIDs can only fail safe (block until the next tick). Drilled under ~20 writes/s both ways and with a forced catch-up timeout (`v030-drill.sh` V9, V10).
+
 ### Switchover rollback after epoch bump (v0.3.0)
 
 Before the epoch CAS and master KV update, failed steps roll back (old primary writable, ProxySQL restored). If writing the master key fails **after** the epoch bump (3 attempts), the guard now aborts cleanly instead of leaving a half-done switchover: the new node is demoted (refused if it already has transactions the old primary lacks), re-pointed at the old primary, the old primary is made writable again and re-published at the bumped epoch, and `switchover-aborted` is alerted. If only the writer-service sync failed after the key was written, the switchover completes and the next leader tick retries the service. Drilled with a `-tags faultinject` build (`integration/scripts/v030-drill.sh` V4); release builds contain no fault hook.
@@ -51,7 +55,7 @@ Admin updates match `mysql_servers` rows by **hostname and port**. Map logical p
 ## Binary
 
 - **`mysql-guard`** — long-running guard (`--mode observe` by default)
-- **`mysql-guard switchover|handover <node>`** — planned handover (GTID-equal + errant checks; full SQL steps TODO)
+- **`mysql-guard switchover|handover <node>`** — planned handover (fence, catch-up, then errant check; see above)
 - **`mysql-guard rejoin <source>`** — errant check + auto-position vs needs-rebuild plan
 
 ## Modes

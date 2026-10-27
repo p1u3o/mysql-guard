@@ -20,7 +20,7 @@ release:
 	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch go build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o $$d/$(BINARY) ./cmd/mysql-guard; \
 	  tar -C $$d -czf $$d.tar.gz $(BINARY); rm -rf $$d; \
 	done
-	cd dist && sha256sum $(BINARY)-$(VERSION)-linux-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+	cd dist && for f in $(BINARY)-$(VERSION)-linux-*.tar.gz; do sha256sum $$f > $$f.sha256; done && cat $(BINARY)-$(VERSION)-linux-*.tar.gz.sha256 > SHA256SUMS && cat SHA256SUMS
 
 clean:
 	rm -rf bin dist

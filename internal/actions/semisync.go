@@ -57,8 +57,9 @@ func (e *Executor) semiRejoinBefore(ctx context.Context, sourceAdm, joinerAdm *m
 		return false
 	}
 	src := sourceAdm.ReadSemiSync(ctx)
+	old := joinerAdm.ReadSemiSync(ctx)
 	rec := e.semiRecord(ctx)
-	want := (src.Known && src.SourceEnabled) || (rec != nil && rec.Pending)
+	want := SemiWanted(src, old, rec)
 	if !want {
 		return false
 	}
@@ -89,4 +90,12 @@ func SemiSyncNote(mode string, age time.Duration) string {
 		return fmt.Sprintf("semi-sync at loss: %s (last sample %s before)", mode, age.Round(time.Second))
 	}
 	return "semi-sync at loss: " + mode
+}
+
+// SemiWanted: semi-sync follows the cluster, not the node. It is wanted when
+// either side has source enabled (a switchover's old primary is the joiner)
+// or the Consul record says the cluster runs (or should run) semi-sync.
+func SemiWanted(src, joiner mysql.SemiSync, rec *consul.SemiSyncRecord) bool {
+	return (src.Known && src.SourceEnabled) || (joiner.Known && joiner.SourceEnabled) ||
+		(rec != nil && (rec.Enabled || rec.Pending))
 }

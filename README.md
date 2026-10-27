@@ -40,9 +40,19 @@ Open `http://<listen>/` on the same `-http` address. The dashboard polls `/statu
 
 `-mysql-peer-endpoints` / `MYSQL_PEER_ENDPOINTS` (`db-a=host:port,db-b=host:port`) with shared `-mysql-user` and password file. Optional `-mysql-tls` and `-mysql-ca-file`. Switchover/rejoin and `/status` cluster view use these connections (local DSN remains fallback for this node).
 
-### Replica-thread alerts during transitions (v0.3.2)
+### One alert per event (v0.3.3; v0.3.2 covered replica threads only)
 
-A switchover or failover writes a transition marker to `mysql/<cluster>/guard/transition` (action, from, to, started, ended). Every guard holds back `repl_io_stopped` and `repl_sql_stopped` while the marker is active (not ended and under 2 minutes old) and for 20s after it ends, and in any case raises them only after the condition has lasted `-repl-thread-alert-delay` (default 45s). A planned switchover or a failover therefore sends one alert (`switchover` or `failover`), not three. A replica thread that really stays stopped still alerts once after the delay. Other replication alerts (lag, stall, read_only drift) are unchanged. Drilled in `v030-drill.sh` V11a/V11b.
+A switchover or failover writes a transition marker to `mysql/<cluster>/guard/transition` (action, from, to, started, ended). Every guard holds back **all** replication-health alerts (`repl_io_stopped`, `repl_sql_stopped`, `primary_read_only`, `read_only_drift`, `repl_lag`, `repl_stalled`, `repl_state_unknown`) while the marker is active (not ended and under 2 minutes old) and for 20s after it ends, and in any case raises one only after the condition has lasted `-repl-alert-delay` (default 45s). The fence of a returning old primary within 30 minutes of the failover that demoted it is folded into the `failover` alert (logged, no separate `fence` alert). A real condition that lasts (thread stopped, primary stuck read-only) still alerts exactly once after the delay.
+
+| Alert | Per event |
+|---|---|
+| `switchover`, `failover`, `switchover-aborted`, `restore_writer`, `errant_gtid`, `needs-rebuild` | sent immediately, one per event |
+| replication-health codes above | held during a transition + 20s, then only after persisting `-repl-alert-delay` |
+| `fence` | folded into `failover` for the returning old primary; sent for any other fence |
+| `proxysql_writer_mismatch` (+ ok) | own grace; not raised while the primary is read-only (ProxySQL read_only monitor), which is the `primary_read_only` / `restore_writer` event |
+| `foreign_master_write` (+ cleared) | held during a transition + 20s; an aborted switchover leaves a `guard/key-repair` note and the leader rewrites the key at the new epoch |
+
+Drilled in `v030-drill.sh`: V3-V9 assert the exact alert list per event (after a 70s settle), V11a asserts no transient codes, V11b (stopped IO thread) and V11c (read-only primary) assert one alert after the delay.
 
 ### Switchover ordering: fence, catch up, then check (v0.3.1)
 
@@ -81,7 +91,7 @@ Admin updates match `mysql_servers` rows by **hostname and port**. Map logical p
 | `--proxysql-admin-enable` | `false` | Admin hostgroup updates on promote/fence |
 | `--ntfy-url` | | Replication / errant / fence alerts |
 | `--repl-lag-alert-sec` | `30` | IO/SQL/lag/read_only drift alerts |
-| `--repl-thread-alert-delay` | `45s` | IO/SQL thread-stopped alerts only after persisting this long and outside a switchover/failover window (`REPL_THREAD_ALERT_DELAY`) |
+| `--repl-alert-delay` | `45s` | replication-health alerts only after persisting this long and outside a switchover/failover window (`REPL_ALERT_DELAY`; old `--repl-thread-alert-delay` / `REPL_THREAD_ALERT_DELAY` still accepted) |
 | `--min-between-failovers` | `1h` | Rate limit between real failovers (writer moves to another node) |
 | `--read-only-grace` | `10s` | A reachable primary that stays read-only this long counts as failed (see below) |
 | Maintenance KV | | `mysql/<cluster>/guard/maintenance` — any value pauses actions |

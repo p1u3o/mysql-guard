@@ -257,7 +257,8 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 		}
 	}
 	if checks.MySQL && r.lock.IsLeader() {
-		r.v030Checks(ctx, now, maint, primary, epochKV)
+		po := obs[primary]
+		r.v030Checks(ctx, now, maint, primary, epochKV, po.err == nil && po.st.ReadOnly)
 	}
 	r.metrics.DeadVotes.WithLabelValues("total").Set(float64(dead))
 	r.lastHealth = now

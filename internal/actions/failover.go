@@ -31,9 +31,7 @@ func (e *Executor) FenceNode(ctx context.Context, node string, epoch uint64, rea
 	if err := e.proxy.ApplyFence(ctx, node); err != nil {
 		e.log.Warn("proxysql fence", "err", err)
 	}
-	if e.alerts != nil {
-		_ = e.alerts.Alert(ctx, "fence", reason, true)
-	}
+	e.fenceAlert(ctx, node, reason)
 	_ = e.store.MarkFenced(ctx, node, epoch)
 	e.actionLog(ctx, epoch, "fence", reason, "ok", "super_read_only")
 	return nil
@@ -100,7 +98,7 @@ func (e *Executor) Failover(ctx context.Context, oldPrimary, candidate string, e
 		e.actionLog(ctx, newEpoch, "failover", err.Error(), "warn", "proxysql")
 	}
 	if e.alerts != nil {
-		_ = e.alerts.Alert(ctx, "failover", reason, true)
+		_ = e.alerts.Alert(ctx, "failover", reason+"; "+oldPrimary+" will be fenced on return (no separate alert)", true)
 	}
 	e.actionLog(ctx, newEpoch, "failover", fmt.Sprintf("%s promoted at epoch %d", candidate, newEpoch), "ok", "end")
 	return nil

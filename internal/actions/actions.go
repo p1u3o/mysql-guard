@@ -92,9 +92,7 @@ func (e *Executor) Fence(ctx context.Context, node string, epoch uint64, oldPrim
 	if err := e.proxy.ApplyFence(ctx, node); err != nil {
 		e.log.Warn("proxysql fence", "err", err)
 	}
-	if e.alerts != nil {
-		_ = e.alerts.Alert(ctx, "fence", reason, true)
-	}
+	e.fenceAlert(ctx, node, reason)
 	return e.store.MarkFenced(ctx, node, epoch)
 }
 
@@ -115,6 +113,7 @@ func (e *Executor) Promote(ctx context.Context, candidate, oldPrimary string, lo
 	if !e.cfg.Promotable {
 		return nil
 	}
+	defer e.markTransition(ctx, "failover", oldPrimary, candidate)()
 	if err := e.mysql.PromoteWritable(ctx); err != nil {
 		return err
 	}

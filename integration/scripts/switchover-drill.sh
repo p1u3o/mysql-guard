@@ -187,6 +187,8 @@ docker compose run -d --rm --no-deps --name "${COMPOSE_PROJECT_NAME:-integration
   --node=db-a --mysql-host=db-a --role=db --mode=observe --cluster=nops --peers=db-a,db-b --mysql-user=nops \
   --mysql-peer-endpoints=db-a=db-a:3306,db-b=db-b:3306 --interval=2s --session-ttl=10s --lock-delay=1s --http=:9474 >/dev/null || fail "start nops guard"
 wait_for 60 "nops guard reports db-a (replica) unknown" sh -c "curl -sf -m5 http://127.0.0.1:9474/status | jq -e '[.nodes[] | select(.node==\"db-a\" and .repl_state==\"unknown\" and .io_thread==null and .sql_thread==null and (.repl_error|test(\"denied\")))] | length == 1'"
+# v0.3.3: replication-health alerts fire once the condition has lasted REPL_ALERT_DELAY (45s)
+wait_for 75 "nops guard logged repl_state_unknown (after the alert delay)" sh -c "docker logs ${COMPOSE_PROJECT_NAME:-integration}-nops 2>&1 | grep -q '\"code\":\"repl_state_unknown\"'"
 sleep 8
 NL=$(docker logs "${COMPOSE_PROJECT_NAME:-integration}-nops" 2>&1)
 echo "$NL" | grep -q '"code":"repl_state_unknown"' || fail "nops guard did not log repl_state_unknown"
@@ -299,7 +301,9 @@ T0=$(date +%s)
 wait_for 40 "$R flagged stalled on both DB guards (witness has no topology)" stalled_on
 log "stalled flagged after $(( $(date +%s) - T0 ))s: $(status 9471 | jq -c --arg n "$R" '.nodes[] | select(.node==$n) | {stalled,stall_reason,gtid_gap_to_writer,gtid_retrieved}')"
 replica_running "$R" || fail "$R threads not ON (stall must be threads ON)"
-docker compose logs --no-color guard-a guard-b 2>/dev/null | grep -q 'repl_stalled' || fail "repl_stalled alert not logged"
+# v0.3.3: alerted once the stall has lasted REPL_ALERT_DELAY (45s)
+stall_logged() { docker compose logs --no-color guard-a guard-b 2>/dev/null | grep -q '"code":"repl_stalled"'; }
+wait_for 75 "repl_stalled alert logged (after the alert delay)" stall_logged || fail "repl_stalled alert not logged"
 E=$(kv_epoch); NF=$(count_ok failover)
 docker compose stop "$P"
 sleep 25

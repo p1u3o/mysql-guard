@@ -132,6 +132,14 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 			// writable at a fresh epoch, exactly like the guard's restore_writer.
 			_ = oldAdm.SetSuperReadOnly(ctx, false)
 			_ = e.proxy.ApplyPromote(ctx, oldPrimary, newPrimary)
+			// v0.3.3: the key/writer-current still carry the old epoch; rewrite
+			// them for old at the new epoch, or leave a repair note for the leader
+			// (otherwise it reads as a foreign master-key write).
+			if serr := e.setMasterRetry(ctx, oldPrimary, newEpoch); serr != nil {
+				if perr := e.store.PutKeyRepair(ctx, oldPrimary, newEpoch); perr != nil {
+					e.log.Warn("key repair note", "err", perr)
+				}
+			}
 			e.actionLog(ctx, newEpoch, "switchover", "set_master failed after epoch bump; new demoted, old restored writable (key unchanged)", "abort", "post_epoch_rollback")
 			e.Alert(ctx, "switchover-aborted", fmt.Sprintf("switchover %s -> %s aborted after epoch bump (%s); %s kept as writer", oldPrimary, newPrimary, err, oldPrimary), true)
 			return fmt.Errorf("switchover aborted: %s", err)

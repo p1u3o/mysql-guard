@@ -31,3 +31,7 @@ func (k KeyPaths) NeedsRebuild(node string) string {
 // Transition marks a switchover or failover in progress (cluster-visible, so
 // every guard can hold back replica-thread alerts caused by the transition).
 func (k KeyPaths) Transition() string { return fmt.Sprintf("mysql/%s/guard/transition", k.Cluster) }
+
+// KeyRepair records "node|epoch" when a switchover aborted after the epoch
+// bump and could not rewrite the master key; the leader rewrites it.
+func (k KeyPaths) KeyRepair() string { return fmt.Sprintf("mysql/%s/guard/key-repair", k.Cluster) }

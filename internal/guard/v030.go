@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"mysql-guard/internal/actions"
 	"mysql-guard/internal/config"
 )
 
@@ -11,7 +12,7 @@ import (
 //   - writer service sync (never in observe mode or maintenance),
 //   - foreign master-key write detection (alert only),
 //   - read-only ProxySQL writer-hostgroup verification (alert only).
-func (r *Runtime) v030Checks(ctx context.Context, now time.Time, maint bool, primary string, epoch uint64) {
+func (r *Runtime) v030Checks(ctx context.Context, now time.Time, maint bool, primary string, epoch uint64, primaryRO bool) {
 	if primary != "" && r.cfg.WriterServiceName != "" && r.cfg.Mode != config.ModeObserve && !maint {
 		wrote, err := r.store.SyncWriterService(ctx, primary, epoch, "guard-sync")
 		switch {
@@ -29,7 +30,25 @@ func (r *Runtime) v030Checks(ctx context.Context, now time.Time, maint bool, pri
 		}
 	}
 
+	if r.cfg.Mode != config.ModeObserve && !maint {
+		if node, ep, err := r.store.GetKeyRepair(ctx); err == nil && node != "" {
+			switch {
+			case node != primary || ep != epoch:
+				// superseded by a later promotion
+				_ = r.store.DeleteKeyRepair(ctx)
+			case r.store.SetMaster(ctx, node, ep) == nil:
+				_ = r.store.DeleteKeyRepair(ctx)
+				r.exec.LogAction(ctx, ep, "key_repair", "master key rewritten for "+node+" at epoch after aborted switchover", "ok", "set_master")
+				r.foreignTicks = 0
+			}
+		}
+	}
 	if r.cfg.ForeignWriteAlert {
+		if n, _, err := r.store.GetKeyRepair(ctx); err == nil && n != "" {
+			r.foreignTicks = 0 // guard-owned repair pending: not a foreign write
+		} else if t, terr := r.store.GetTransition(ctx); terr == nil && actions.TransitionActive(t, now) {
+			r.foreignTicks = 0 // switchover/failover in flight (+grace): key/epoch briefly disagree
+		}
 		val, foreign, err := r.store.ForeignWriter(ctx)
 		if err == nil && foreign {
 			r.foreignTicks++
@@ -54,6 +73,13 @@ func (r *Runtime) v030Checks(ctx context.Context, now time.Time, maint bool, pri
 			msg = "ProxySQL admin query failed: " + err.Error()
 		} else {
 			msg = proxysqlMismatch(online, want)
+		}
+		if msg != "" && err == nil && primaryRO && !contains(online, want) {
+			// v0.3.3: ProxySQL's read_only monitor pulled the read-only primary
+			// out of the writer hostgroup; that is the primary_read_only /
+			// restore_writer event, not a second one.
+			r.pxSince = time.Time{}
+			return
 		}
 		if msg == "" {
 			if r.pxAlerted != "" {
@@ -80,6 +106,15 @@ func proxysqlMismatch(online []string, want string) string {
 		return ""
 	}
 	return "ProxySQL writer hostgroup ONLINE=" + join(online) + ", writer key says " + want
+}
+
+func contains(a []string, s string) bool {
+	for _, x := range a {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 func join(a []string) string {

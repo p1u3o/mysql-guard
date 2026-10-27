@@ -87,6 +87,16 @@ svc() { curl -sf -m 5 "http://127.0.0.1:8500/v1/catalog/service/example-writer" 
 svc_is() { [ "$(svc)" = "$1" ]; }
 alerts() { curl -sf -m 5 "http://127.0.0.1:18093/mg-drill/json?poll=1&since=all" | jq -r '.title // empty'; }
 alert_n() { alerts | grep -cx "mysql-guard example: $1" || true; }
+# per-event alert accounting: ev_begin before an event; ev_check "<expected titles>" waits past the
+# transition grace + alert delay (70s) and requires the new alerts to be exactly the expected list.
+ev_begin() { EVN=$(alerts | wc -l | tr -d ' '); }
+ev_check() { # <label> <expected codes, space-separated>
+  local lbl=$1; shift; sleep "${EV_WAIT:-70}"
+  local got want; got=$(alerts | tail -n +$((EVN+1)) | sed 's/^mysql-guard example: //' | sort | tr '\n' ' ' | sed 's/ $//')
+  want=$(printf '%s\n' "$@" | sort | tr '\n' ' ' | sed 's/ $//')
+  [ "$got" = "$want" ] || fail "$lbl: alerts [$got], want exactly [$want]"
+  log "$lbl: alerts exactly [$got]"
+}
 alert_gt() { [ "$(alert_n "$1")" -gt "$2" ]; }
 px() { docker compose exec -T db-b mysql -h proxysql -P6033 -uroot -pplaceholder -N -B -e "$1" 2>/dev/null; }
 px_write() { px "INSERT INTO drill.t VALUES ('$1')"; }
@@ -149,6 +159,7 @@ snap v2-legacy
 pass "V2: legacy key read in act mode, service=db-a:3306, migrate legacy->epoch->legacy with no action, ProxySQL write ok"
 
 log "=== V3: switchover db-a -> db-b (legacy key, service, ProxySQL, ntfy) ==="
+ev_begin
 E=$(kv_epoch); A=$(alert_n switchover)
 docker compose exec -T guard-a mysql-guard switchover db-b --node=db-a --mysql-host=db-a "${FLAGS[@]}" || fail "switchover exit"
 wait_for 20 "primary db-b" primary_is db-b
@@ -161,9 +172,11 @@ wait_for 20 "switchover alert" alert_gt switchover "$A"
 writes_through_proxysql_land_on db-b v3
 wait_for 30 "v3 on db-a" row_on db-a v3
 snap v3-switchover
+ev_check V3 switchover
 pass "V3: switchover epoch $E->$(kv_epoch), key=$(master), service=$(svc), ProxySQL writer=$(px_writer), alert delivered"
 
 log "=== V4: aborted switchover after the epoch bump (fault-injected SetMaster) ==="
+ev_begin
 E=$(kv_epoch); A=$(alert_n switchover-aborted)
 for g in guard-a guard-b; do docker compose exec -T $g touch /tmp/fault-setmaster; done
 docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=db-b "${FLAGS[@]}" && fail "faulted switchover reported success"
@@ -178,11 +191,15 @@ wait_for 20 "switchover-aborted alert" alert_gt switchover-aborted "$A"
 sleep 6; primary_is db-b || fail "primary moved after abort"
 wait_for 30 "writer service still db-b" svc_is db-b:3306
 writes_through_proxysql_land_on db-b v4
+key_repaired() { [ "$(kv mysql/example/writer/current)" = "db-b|$(kv_epoch)" ] && [ -z "$(kv mysql/example/guard/key-repair)" ]; }
+wait_for 30 "writer/current repaired to the new epoch" key_repaired
 wait_for 30 "v4 on db-a" row_on db-a v4; wait_for 30 "GTIDs match after abort" gtids_match
 snap v4-abort
+ev_check V4 switchover-aborted
 pass "V4: aborted switchover rolled back: db-b writer, db-a replica, epoch $E->$(kv_epoch), alert delivered"
 
 log "=== V5: switch back db-b -> db-a ==="
+ev_begin
 E=$(kv_epoch)
 docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "switchback exit"
 wait_for 20 "primary db-a" primary_is db-a
@@ -191,10 +208,12 @@ master_is db-a:3306 || fail "key $(master)"
 wait_for 20 "writer service -> db-a:3306" svc_is db-a:3306
 writes_through_proxysql_land_on db-a v5
 wait_for 30 "v5 on db-b" row_on db-b v5
+ev_check V5 switchover
 pass "V5: switchback epoch $E->$(kv_epoch), service=$(svc)"
 
 log "=== V6: kill primary db-a -> failover (service, ProxySQL, ntfy) ==="
 wait_for 30 "GTIDs match before kill" gtids_match
+ev_begin
 E=$(kv_epoch); A=$(alert_n failover); M=$(alert_n proxysql_writer_mismatch)
 docker compose stop db-a
 T0=$(date +%s)
@@ -218,6 +237,7 @@ wait_for 20 "primary db-a" primary_is db-a
 wait_for 20 "writer service -> db-a:3306" svc_is db-a:3306
 writes_through_proxysql_land_on db-a v6b
 snap v6-failover
+ev_check "V6 (kill+rejoin+switchback)" failover switchover
 pass "V6: failover in <=90s, key/service followed, ProxySQL writes ok, alert delivered, back on db-a"
 
 log "=== V7: ProxySQL writer mismatch detected (read-only verify) ==="
@@ -256,6 +276,7 @@ load_stop() { docker compose exec -T db-b bash -c 'kill $(cat /tmp/load.pid) 2>/
 load_rate() { sqlq "$1" "SELECT ROUND(COUNT(*)/GREATEST(TIMESTAMPDIFF(MICROSECOND,MIN(ts),MAX(ts))/1e6,1),1) FROM drill.load WHERE tag='$2'"; }
 for dir in "db-a db-b guard-a" "db-b db-a guard-b"; do
   set -- $dir; FROM=$1; TO=$2; G=$3; TAG="v9${TO#db-}"
+  ev_begin
   E=$(kv_epoch); A=$(alert_n switchover); AB=$(alert_n switchover-aborted); ER=$(alert_n errant_gtid)
   load_start "$TAG"; sleep 5
   docker compose exec -T "$G" mysql-guard switchover "$TO" --node="$FROM" --mysql-host="$FROM" "${FLAGS[@]}" || { load_stop; fail "switchover $FROM->$TO under load"; }
@@ -273,14 +294,16 @@ for dir in "db-a db-b guard-a" "db-b db-a guard-b"; do
   awk -v r="$RATE" 'BEGIN{exit !(r>=20 && r<=50)}' || fail "load rate $RATE/s outside 20-50"
   writes_through_proxysql_land_on "$TO" "$TAG-after"
   snap "v9-$FROM-$TO"
+  ev_check "V9 $FROM->$TO" switchover
   pass "V9: switchover $FROM->$TO under ~${RATE} writes/s ($N rows, identical on both), epoch $E->$(kv_epoch), no errant/abort alert"
 done
 
-log "=== V11a: no replica-thread alerts from planned switchovers / failover (V3-V9) ==="
-RIO=$(alert_n repl_io_stopped); RSQL=$(alert_n repl_sql_stopped)
-[ "$RIO$RSQL" = 00 ] || fail "replica-thread alerts during transitions: io=$RIO sql=$RSQL"
+log "=== V11a: no transient alerts from planned switchovers / failover (V3-V9) ==="
+for c in repl_io_stopped repl_sql_stopped primary_read_only read_only_drift repl_state_unknown repl_lag repl_stalled fence; do
+  [ "$(alert_n $c)" = 0 ] || fail "transient alert $c sent during V3-V9: $(alert_n $c)"
+done
 log "alerts so far: $(alerts | sort | uniq -c | tr '\n' ';')"
-pass "V11a: switchovers/failover produced 0 repl_io_stopped / repl_sql_stopped alerts"
+pass "V11a: each switchover/failover sent exactly one alert; 0 thread/read_only/lag/unknown/fence alerts"
 
 log "=== V10: catch-up timeout -> clean abort, source writable, epoch unchanged ==="
 primary_is db-a || fail "precondition primary db-a"
@@ -312,6 +335,17 @@ wait_for 90 "repl_io_stopped alert" alert_gt repl_io_stopped "$RIO"
 sleep 15; [ "$(alert_n repl_io_stopped)" = "$((RIO+1))" ] || fail "expected exactly one repl_io_stopped alert, got $(( $(alert_n repl_io_stopped) - RIO ))"
 sqlq db-b "START REPLICA IO_THREAD"; wait_for 30 "db-b replicating" replica_running db-b; wait_for 30 "GTIDs match" gtids_match
 pass "V11b: persistent IO stop alerted once after the delay"
+
+log "=== V11c: a lasting read-only primary still alerts exactly once (maintenance on, no action) ==="
+docker compose exec -T consul consul kv put mysql/example/guard/maintenance "v11c" >/dev/null
+sleep 6; ev_begin
+sqlq db-a "SET GLOBAL super_read_only=ON"
+sleep 20; [ "$(alerts | wc -l | tr -d ' ')" = "$EVN" ] || fail "alert before hold delay"
+EV_WAIT=55 ev_check V11c primary_read_only
+sqlq db-a "SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF"
+docker compose exec -T consul consul kv delete mysql/example/guard/maintenance >/dev/null
+writes_through_proxysql_land_on db-a v11c; wait_for 30 "GTIDs match" gtids_match
+pass "V11c: persistent read-only primary alerted once after the delay, no action under maintenance"
 
 SK=$(count_skipped); [ "$SK" = 0 ] || fail "$SK skipped action entries"
 two_writers && fail "TWO WRITERS at end"

@@ -16,7 +16,7 @@ import (
 // (stall, GTID superset, semi-sync, rate limit, epoch CAS).
 //
 // Voters, at most one vote each, and only from fresh heartbeats (younger than
-// 3*interval+1s) that are about the same primary as the leader's view:
+// VoteMaxAge: 3*interval + 2*probe-timeout + 1s) that are about the same primary as the leader's view:
 //
 //  1. db guard "probe": the guard's own MySQL probe of the primary failed
 //     (PrimaryOK=false). The leader counts its own probe directly.
@@ -147,4 +147,12 @@ func CountDeadVotes(self string, selfPrimaryOK bool, primary string, guards []co
 		}
 	}
 	return CountQuorum(QuorumInput{Self: self, SelfPrimaryOK: selfPrimaryOK, Primary: primary, Guards: dbOnly, Now: now, MaxAge: maxAge}).Votes
+}
+
+// VoteMaxAge is how old a guard heartbeat may be and still vote. A guard whose
+// primary just died spends up to a probe timeout (or two) per tick waiting on
+// it, so its heartbeats arrive slower than -interval exactly when its vote is
+// needed; 3*interval alone dropped the primary guard's probe vote (drill D4).
+func VoteMaxAge(interval, probeTimeout time.Duration) time.Duration {
+	return 3*interval + 2*probeTimeout + time.Second
 }

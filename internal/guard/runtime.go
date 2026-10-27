@@ -378,7 +378,7 @@ func (r *Runtime) decide(ctx context.Context, now time.Time, maint bool, primary
 	r.mu.RUnlock()
 	q := CountQuorum(QuorumInput{
 		Self: r.cfg.NodeName, SelfRole: string(r.cfg.Role), SelfPrimaryOK: obs[primary].err == nil, SelfIOLost: selfIO,
-		Primary: primary, Guards: guards, Now: now, MaxAge: 3*r.cfg.Interval + time.Second,
+		Primary: primary, Guards: guards, Now: now, MaxAge: VoteMaxAge(r.cfg.Interval, r.cfg.ProbeTimeout),
 	})
 	r.mu.Lock()
 	r.quorum = q

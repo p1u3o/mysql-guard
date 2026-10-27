@@ -61,7 +61,7 @@ Each guard runs three independent loops: lock renewal (Consul session), health (
 
 ### Failover quorum
 
-A failover tick counts only with at least `-votes-needed` (default 2) votes; `-dead-after` must also pass and the primary must look dead on 3 consecutive ticks. Every voter needs a fresh heartbeat (at most 3 x `-interval` + 1s old) and must see the same primary. One vote each:
+A failover tick counts only with at least `-votes-needed` (default 2) votes; `-dead-after` must also pass and the primary must look dead on 3 consecutive ticks. Every voter needs a fresh heartbeat (at most 3 x `-interval` + 2 x `-probe-timeout` + 1s old, so a guard slowed by a dead primary still votes) and must see the same primary. One vote each:
 
 | Voter | Vote "dead" when |
 |---|---|

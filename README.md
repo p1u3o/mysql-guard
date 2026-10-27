@@ -1,209 +1,387 @@
 # mysql-guard
 
-Draft Go service for MySQL GTID async-replication failover guarding: Consul session leadership, epoch fencing, GTID promotion gate, and separate health / renewal / leader-watch loops. **Not production-ready** — intended for review and test-env drills.
+A failover guard for a two-node MySQL pair using asynchronous GTID replication. It watches the pair, and when the primary fails it promotes the replica. Consul handles coordination.
 
-## Build and test
+Latest release: **v0.3.4**. Releases are listed under [Releases](#releases).
 
-```bash
-go build -o mysql-guard ./cmd/mysql-guard
-go vet ./...
-go test ./...
-make release   # static linux/amd64 tarball + .sha256 in dist/
-./integration/scripts/drill.sh   # docker-compose + smoke drill
+## What it is for
+
+- **Setup:** one primary and one replica (MySQL 8, GTID, `SOURCE_AUTO_POSITION`, async replication), with ProxySQL in front and Consul for coordination.
+- **Sole promoter:** the guard is the only component allowed to promote a node or change the writer. Every other tool (replication-manager, old scripts) must be set to manual or no-op. If anything else writes the writer key, the guard raises an alert.
+- **One guard per node, plus a witness:** each DB host runs a `db` guard, and a third host runs a `witness`. Only `db` guards compete for the Consul leader lock. The current leader is the only guard that acts.
+- **Safety:** the guard never promotes a node that is missing GTIDs. A writer change bumps an epoch with a Consul CAS write, so a stale writer can be recognised and fenced.
+
+## What it does
+
+| Area | Behaviour |
+|---|---|
+| Monitoring | Every `-interval` (default 2s), each `db` guard probes MySQL and reads replication state (IO/SQL threads, lag, `read_only`, GTID sets). It publishes a heartbeat to Consul and serves `/status`, `/metrics` and a read-only web UI. |
+| Failover | Applies only in `act` mode, on the leader. Failover starts when at least `-votes-needed` guards report the primary dead for 3 consecutive ticks. It also starts when a reachable primary stays read-only for longer than `-read-only-grace` and lacks data. The leader then promotes the most advanced replica that passes all gates: not stalled, no errant GTIDs, executed+retrieved is a superset of the last published writer GTIDs, and retrieved GTIDs applied (`-lag-gate-max-wait`, 0 = never promote with missing GTIDs). Failovers are rate-limited by `-min-between-failovers` (default 1h). |
+| Restore writer | A primary that is read-only but has complete data is made writable again at epoch+1, with no failover. This is not rate-limited. |
+| Switchover | Run as `mysql-guard switchover <target>`. Steps: fence the old primary (`super_read_only`, ProxySQL offline, drain open transactions for `-fence-drain-timeout`, then kill them), wait for the target to catch up (`-switchover-catchup-timeout`), run an errant-GTID check both ways, then bump the epoch and write the key. Any failure before the epoch bump rolls back. A key-write failure after the bump also rolls back, and the alert is `switchover-aborted`. |
+| Rejoin | Run as `mysql-guard rejoin <source>`. It runs an errant-GTID check, then either re-points this node with auto-position or marks it `needs-rebuild` (`mysql/<cluster>/guard/needs-rebuild/<node>`). |
+| Fencing | Applies in `fence` and `act` modes. Any non-primary that stays writable for 2 ticks is set to `super_read_only=ON`. |
+| Writer key | Writes `mysql/master/<cluster>` (format chosen by `-master-format`). On an empty cluster, the leader seeds the key when every peer is reachable, exactly one peer is writable, and no other peer has GTIDs the writer lacks. |
+| Writer service | When `-writer-service` is set, the leader keeps a Consul catalog service on node `<name>-vnode` pointing at the primary, with Meta `cluster`, `node`, `epoch` and `promoted_by=mysql-guard`. |
+| ProxySQL | By default ProxySQL follows `read_only` and the guard never writes to ProxySQL. With `-proxysql-admin-enable` (or `-proxysql-mode=admin`), it updates `mysql_servers` on promote and fence. With `-proxysql-verify`, it only reads `runtime_mysql_servers` and alerts on a writer mismatch. |
+| Alerts | Sends ntfy notifications (`-ntfy-url`) and updates the Consul TTL check `<service-id>:guard`. You get one alert per event. See [Reading alerts](#reading-alerts). |
+| Maintenance | While `mysql/<cluster>/guard/maintenance` exists (any value), the guard takes no fence, failover, restore or writer-service actions. |
+
+## What it does NOT do
+
+- No Group Replication, InnoDB Cluster, semi-sync management, or setups with more than one writer. It handles async GTID replication only.
+- No backups, rebuilds or clones. A `needs-rebuild` node has to be rebuilt by hand.
+- It does not skip replication errors automatically.
+- In **`observe` mode** (the default), it never writes cluster state: no master key, epoch, `writer/current`, `writer/last-gtid`, writer service, MySQL `read_only`, or ProxySQL. It still runs the full decision loop and logs what it would do (`mysql_guard_would_act_total`). It does write its own bookkeeping: the leader lock/session, instance heartbeats and the action log.
+- The **witness** never connects to MySQL: no probes, no replication alerts, no leader lock. It only takes part in Consul coordination (`ChecksFor(witness)` has no checks).
+- `fence` mode fences stray writers but never promotes.
+
+## How it works
+
+```
+             +-------------- Consul KV / sessions --------------+
+             |  leader lock, epoch, writer key, heartbeats, log |
+             +----^------------------^------------------^-------+
+                  |                  |                  |
+          guard (db, node A)  guard (db, node B)  guard (witness)
+                  |                  |               (no MySQL)
+              MySQL A  ==async GTID==>  MySQL B
+                  ^                  ^
+                  +---- ProxySQL ----+   (follows read_only, or admin mode)
 ```
 
-Required flags (or env): `--cluster` / `GUARD_CLUSTER`, `--peers` / `GUARD_PEERS`, `--node` / `GUARD_NODE`.
+Roles, as set by `ChecksFor` in `internal/guard/runtime.go`:
 
-Subcommands (`switchover`, `handover`, `rejoin`) accept the same flags in any position; an optional positional argument is the target peer name.
+| Role | MySQL probes | Replication alerts | Competes for leader | Promotable |
+|---|---|---|---|---|
+| `db` | yes | yes | yes | yes |
+| `witness` | no | no | no | no |
 
-### MySQL credentials
+Each guard runs three independent loops: lock renewal (Consul session), health (probes, votes, alerts, leader decisions) and leader-watch.
 
-Either set `-mysql-dsn` (no password in the DSN when using `-mysql-password-file`), or set `-mysql-user`, `-mysql-host`, `-mysql-port`, and `-mysql-password-file` / `MYSQL_PASSWORD`. The guard builds the DSN from host, port, user, and file contents.
+### Consul key layout
 
-### Consul agent service
+| Key | Written by | Meaning |
+|---|---|---|
+| `mysql/master/<cluster>` | leader (act/fence) | Current writer, as `node\|epoch` (epoch format) or `host:port` (legacy format) |
+| `mysql/<cluster>/writer/epoch` | leader | Epoch counter, changed with CAS |
+| `mysql/<cluster>/writer/current` | leader | `node\|epoch` (used with the legacy format) |
+| `mysql/<cluster>/writer/last-gtid` | leader | Last published writer `gtid_executed`, used by the superset gate |
+| `mysql/<cluster>/guard/leader` | db guards | Leader lock (session) |
+| `mysql/<cluster>/guard/instance/<node>` | every guard | Heartbeat and vote |
+| `mysql/<cluster>/guard/gtid/<node>` | guards | Per-node GTID state |
+| `mysql/<cluster>/guard/fenced/<node>` | leader | Fence marker |
+| `mysql/<cluster>/guard/last-failover` | leader | Rate-limit timestamp |
+| `mysql/<cluster>/guard/transition` | leader / CLI | Switchover or failover in progress (used to hold alerts) |
+| `mysql/<cluster>/guard/key-repair` | CLI | `node\|epoch` for the leader to rewrite after an aborted switchover |
+| `mysql/<cluster>/guard/needs-rebuild/<node>` | rejoin | Node must be rebuilt |
+| `mysql/<cluster>/guard/maintenance` | operator | Exists = pause all actions |
+| `mysql/<cluster>/actions` | guards | Action log (CAS append, capped at `-action-log-max`) |
 
-Set `-consul-service-id` (and optionally `-consul-service-name`, default `mysql-guard`) to register the local agent service with a TTL check (`<id>:guard`). Replication and fence alerts update that check; if registration fails, TTL updates log once and are disabled.
+## Configuration
 
-### Initial writer KV
+Every option is a flag. Where an env var column has a value, the env var sets the default and the flag overrides it. Single (`-x`) and double (`--x`) dashes both work. `-cluster`, `-node` and `-peers` are required.
 
-On a fresh cluster, the **leader** seeds `mysql/master/<cluster>` from the observed topology: only when the key is empty, every peer is reachable, exactly one peer is writable, and no other peer has GTIDs missing from that writer. Seeding is logged to the action log (`seed_primary`).
+### Identity and mode
 
-Only `db` guards compete for the leader lock (non-blocking session acquire, retried every `session-ttl/3`). `witness` guards take part in Consul coordination only and skip MySQL and replication checks.
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `-cluster` | `GUARD_CLUSTER` | (required) | Cluster name used in KV keys |
+| `-node` | `GUARD_NODE` | (required) | This guard's logical name. On a `db` guard it must match a peer name. |
+| `-peers` | `GUARD_PEERS` | (required) | Comma-separated DB peer names, e.g. `db-a,db-b` |
+| `-role` | `GUARD_ROLE` | `db` | `db` or `witness` |
+| `-mode` | `GUARD_MODE` | `observe` | `observe`, `fence` or `act` |
+| `-http` | `GUARD_HTTP` | `:9470` | Listen address for UI, `/status`, `/metrics`, `/healthz` |
 
-Automatic failover (mode `act`): the leader promotes the most advanced reachable replica when at least `--votes-needed` DB guards report the primary unreachable for three consecutive ticks. A non-primary peer that stays writable for two ticks is fenced (`super_read_only`).
+### MySQL
 
-### Web UI
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `-mysql-dsn` | `MYSQL_DSN` | | Full local DSN. Leave the password out if you use a password file. |
+| `-mysql-host` | `MYSQL_HOST` | `127.0.0.1` | Local host, used when the DSN is built from `-mysql-user` |
+| `-mysql-port` | `MYSQL_PORT` | `3306` | Local port, and the default port for peers |
+| `-mysql-user` | `MYSQL_USER` | | Guard (admin) user |
+| `-mysql-password-file` | `MYSQL_PASSWORD_FILE` | | File containing the guard password. If unset, `MYSQL_PASSWORD` (env only) is used. |
+| `-mysql-repl-user` | `MYSQL_REPL_USER` | (guard user) | Account used in `CHANGE REPLICATION SOURCE` |
+| `-mysql-repl-password-file` | `MYSQL_REPL_PASSWORD_FILE` | | Replication password file. If unset, `MYSQL_REPL_PASSWORD` (env only) is used. |
+| `-mysql-peer-endpoints` | `MYSQL_PEER_ENDPOINTS` | | `db-a=host:port,db-b=host:port`. Used for remote peer connections and to map `host:port` to a node in the legacy key format. |
+| `-mysql-tls` | `MYSQL_TLS` | `false` | Use TLS for peer connections |
+| `-mysql-ca-file` | `MYSQL_CA_FILE` | | CA PEM for peer TLS |
+| `-repl-stmt-timeout` | `REPL_STMT_TIMEOUT` | `30s` | Timeout for replication statements (CHANGE SOURCE, START/STOP/RESET REPLICA) |
+| `-repl-connect-timeout` | `REPL_CONNECT_TIMEOUT` | `30s` | Maximum wait for a re-pointed replica's IO and SQL threads to come up |
 
-Open `http://<listen>/` on the same `-http` address. The dashboard polls `/status` and `GET /api/actions` (read-only). Action history is stored in Consul KV `mysql/<cluster>/actions` (cap `--action-log-max`, default 500) via CAS append.
+### Consul
 
-### Remote peer MySQL
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `-consul-addr` | `CONSUL_HTTP_ADDR` | `127.0.0.1:8500` | Consul HTTP address |
+| `-consul-token-file` | `CONSUL_TOKEN_FILE` | | ACL token file. If unset, `CONSUL_HTTP_TOKEN` (env only) is used. |
+| `-consul-service-id` | `CONSUL_SERVICE_ID` | | Registers an agent service with the TTL check `<id>:guard`. Recommended. |
+| `-consul-service-name` | `CONSUL_SERVICE_NAME` | `mysql-guard` | Service name for that registration |
+| `-session-ttl` | | `15s` | Leader session TTL |
+| `-lock-delay` | | `15s` | Consul lock delay |
+| `-master-format` | `MASTER_FORMAT` | `epoch` | Write format of `mysql/master/<cluster>`: `epoch` or `legacy`. Reads always accept both. |
+| `-writer-service` | `WRITER_SERVICE` | (off) | Name of the catalog service kept pointing at the writer |
+| `-writer-service-tags` | `WRITER_SERVICE_TAGS` | `mysql,writer` | Tags for that service |
+| `-action-log-max` | | `500` | Maximum entries in `mysql/<cluster>/actions` |
 
-`-mysql-peer-endpoints` / `MYSQL_PEER_ENDPOINTS` (`db-a=host:port,db-b=host:port`) with shared `-mysql-user` and password file. Optional `-mysql-tls` and `-mysql-ca-file`. Switchover/rejoin and `/status` cluster view use these connections (local DSN remains fallback for this node).
+### Detection and failover
 
-### One alert per event (v0.3.3; v0.3.2 covered replica threads only)
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `-interval` | | `2s` | Health loop interval |
+| `-probe-timeout` | | `3s` | Deadline for each probe |
+| `-slow-threshold` | | `4` | Consecutive slow probes before a probe counts as failed |
+| `-dead-after` | | `30s` | Time since the first failure before a vote counts as dead |
+| `-votes-needed` | | `2` | Dead votes required before a failover tick counts |
+| `-min-between-failovers` | | `1h` | Minimum time between real failovers |
+| `-max-apply-lag` | | `30s` | Time allowed to apply retrieved GTIDs |
+| `-lag-gate-max-wait` | | `0` | Maximum wait for missing GTIDs. `0` = never promote while GTIDs are missing. |
+| `-fence-grace` | | `30s` | Grace period before fencing a node marked as sole writer |
+| `-read-only-grace` | | `10s` | A reachable primary that is read-only for this long counts as failed (restored if its data is complete, otherwise failover) |
+| `-replica-stale` | | `35s` | Staleness threshold for heartbeat and last-queued transaction |
+| `-stall-after` | `STALL_AFTER` | `30s` | A replica whose threads are ON but whose GTID gap does not shrink for this long is `stalled`. It raises an alert and is never a candidate. |
+| `-fence-drain-timeout` | `FENCE_DRAIN_TIMEOUT` | `3s` | Switchover: wait for open transactions on the fenced source, then kill them |
+| `-switchover-catchup-timeout` | `SWITCHOVER_CATCHUP_TIMEOUT` | `0` (= 2x `-max-apply-lag`) | Switchover: maximum wait for the target to catch up |
 
-A switchover or failover writes a transition marker to `mysql/<cluster>/guard/transition` (action, from, to, started, ended). Every guard holds back **all** replication-health alerts (`repl_io_stopped`, `repl_sql_stopped`, `primary_read_only`, `read_only_drift`, `repl_lag`, `repl_stalled`, `repl_state_unknown`) while the marker is active (not ended and under 2 minutes old) and for 20s after it ends, and in any case raises one only after the condition has lasted `-repl-alert-delay` (default 45s). The fence of a returning old primary within 30 minutes of the failover that demoted it is folded into the `failover` alert (logged, no separate `fence` alert). A real condition that lasts (thread stopped, primary stuck read-only) still alerts exactly once after the delay.
+### ProxySQL
 
-| Alert | Per event |
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `-proxysql-mode` | `PROXYSQL_MODE` | `monitor` | `monitor` (no writes) or `admin` (same as `-proxysql-admin-enable`) |
+| `-proxysql-admin-enable` | `PROXYSQL_ADMIN_ENABLE` | `false` | Update `mysql_servers` on promote and fence |
+| `-proxysql-admin-dsn` | `PROXYSQL_ADMIN_DSN` | | ProxySQL admin DSN |
+| `-proxysql-writer-hg` | | `10` | Writer hostgroup |
+| `-proxysql-reader-hg` | | `11` | Reader hostgroup |
+| `-proxysql-peer-endpoints` | `PROXYSQL_PEER_ENDPOINTS` | | `db-a=host:port,...` mapping to `mysql_servers` rows. Unmapped peers are matched as `<peer>:3306`. |
+| `-proxysql-verify` | `PROXYSQL_VERIFY` | `false` | Read-only comparison of the runtime writer hostgroup with the writer key. Alerts only. |
+| `-proxysql-verify-grace` | `PROXYSQL_VERIFY_GRACE` | `20s` | How long a mismatch must last before it alerts |
+
+### Alerts
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `-ntfy-url` | `NTFY_URL` | (off) | ntfy topic URL |
+| `-ntfy-token-file` | `NTFY_TOKEN_FILE` | | Bearer token file |
+| `-repl-lag-alert-sec` | | `30` | Lag alert threshold, in seconds |
+| `-repl-alert-delay` | `REPL_ALERT_DELAY` | `45s` | A replication-health condition must persist this long before it alerts. Old names `-repl-thread-alert-delay` / `REPL_THREAD_ALERT_DELAY` still work. |
+| `-fence-followup-window` | `FENCE_FOLLOWUP_WINDOW` | `30m` | After a failover, the old primary waiting to rejoin is fenced without a separate alert, and its replication alerts are held for this long |
+| `-foreign-write-alert` | `FOREIGN_WRITE_ALERT` | `true` | Alert when something other than a guard writes the master key |
+
+Boolean env vars accept `1`, `true` or `yes`.
+
+## Required MySQL grants and Consul policy
+
+### MySQL (guard user, on every DB node; the witness needs none)
+
+The examples below use placeholders (`<guard-user>`, `<host>`).
+
+**observe mode:** read-only access to replication and GTID state:
+
+```sql
+GRANT PROCESS, REPLICATION CLIENT ON *.* TO '<guard-user>'@'<host>';
+GRANT SELECT ON performance_schema.* TO '<guard-user>'@'<host>';
+```
+
+**fence / act mode:** additionally needs to set `read_only` / `super_read_only`, run STOP/START/RESET REPLICA and CHANGE REPLICATION SOURCE, and kill sessions while fencing:
+
+```sql
+GRANT SYSTEM_VARIABLES_ADMIN, REPLICATION_SLAVE_ADMIN, CONNECTION_ADMIN ON *.* TO '<guard-user>'@'<host>';
+-- SUPER also covers these, but is deprecated in MySQL 8
+```
+
+The replication account (`-mysql-repl-user`, or the guard user if that is unset) needs `REPLICATION SLAVE`.
+
+For `-proxysql-verify`, use a dedicated ProxySQL admin user. The guard only runs `SELECT`s, but ProxySQL has no read-only admin role.
+
+### Consul ACL
+
+**observe mode:** the guard reads cluster state and writes only its own bookkeeping:
+
+```hcl
+key_prefix "mysql/master/<cluster>"  { policy = "read" }
+key_prefix "mysql/<cluster>/writer/" { policy = "read" }
+key_prefix "mysql/<cluster>/guard/"  { policy = "write" }  # leader lock, instance heartbeats
+key_prefix "mysql/<cluster>/actions" { policy = "write" }
+session_prefix "" { policy = "write" }
+# only if -consul-service-id is set:
+service "mysql-guard" { policy = "write" }
+node_prefix "" { policy = "read" }
+```
+
+**act / fence mode:** add write access to the writer key and the writer service:
+
+```hcl
+key_prefix "mysql/master/<cluster>"  { policy = "write" }
+key_prefix "mysql/<cluster>/writer/" { policy = "write" }
+# only if -writer-service is set:
+service "<writer-service>"      { policy = "write" }
+node    "<writer-service>-vnode" { policy = "write" }
+```
+
+## Deploying with Nomad
+
+Release assets are static Linux binaries: `mysql-guard-<version>-linux-amd64.tar.gz` and `mysql-guard-<version>-linux-arm64.tar.gz`, each with a `.sha256` file. The repository is private, so host the tarball where your Nomad clients can fetch it. Pass secrets as files rendered from your secret store, never as literals.
+
+The job below is minimal and uses placeholders only. Run one `db` guard on each DB host and one witness on a third host. For arm64 hosts, swap the artifact for the arm64 asset and the `cpu.arch` constraint value.
+
+```hcl
+job "mysql-guard-<cluster>" {
+  datacenters = ["<dc>"]
+
+  group "db" {
+    count = 2
+    constraint { distinct_hosts = true }
+    constraint {
+      attribute = "${attr.cpu.arch}"
+      value     = "amd64"                     # arm64 hosts: "arm64"
+    }
+
+    task "guard" {
+      driver = "exec"
+
+      artifact {
+        # arm64: mysql-guard-v0.3.4-linux-arm64.tar.gz
+        source      = "<artifact-base-url>/mysql-guard-v0.3.4-linux-amd64.tar.gz"
+        destination = "local/"
+        options { checksum = "sha256:<sha256-from-release>" }
+      }
+
+      config {
+        command = "local/mysql-guard"
+        args = [
+          "-cluster=<cluster>",
+          "-node=${node.unique.name}",        # must match a peer name
+          "-peers=<db-a>,<db-b>",
+          "-role=db",
+          "-mode=observe",                    # act once the shadow run is clean
+          "-mysql-user=<guard-user>",
+          "-mysql-password-file=${NOMAD_SECRETS_DIR}/mysql_password",
+          "-mysql-peer-endpoints=<db-a>=<host-a>:3306,<db-b>=<host-b>:3306",
+          "-consul-token-file=${NOMAD_SECRETS_DIR}/consul_token",
+          "-consul-service-id=mysql-guard-${node.unique.name}",
+          "-ntfy-url=<ntfy-topic-url>",
+        ]
+      }
+
+      # template blocks that render mysql_password / consul_token into secrets/
+
+      resources {
+        cpu    = 100
+        memory = 64
+      }
+    }
+  }
+
+  group "witness" {
+    count = 1
+    constraint {
+      attribute = "${attr.cpu.arch}"
+      value     = "arm64"                     # or amd64
+    }
+
+    task "guard" {
+      driver = "exec"
+      artifact {
+        source      = "<artifact-base-url>/mysql-guard-v0.3.4-linux-arm64.tar.gz"
+        destination = "local/"
+        options { checksum = "sha256:<sha256-from-release>" }
+      }
+      config {
+        command = "local/mysql-guard"
+        args = [
+          "-cluster=<cluster>",
+          "-node=witness-1",
+          "-peers=<db-a>,<db-b>",
+          "-role=witness",
+          "-consul-token-file=${NOMAD_SECRETS_DIR}/consul_token",
+        ]
+      }
+      resources {
+        cpu    = 50
+        memory = 32
+      }
+    }
+  }
+}
+```
+
+`examples/nomad/mysql-guard.hcl` is an older docker-based sketch.
+
+### Migrating from the bash guard / replication-manager
+
+1. Run the guards with `-mode=observe -master-format=legacy` next to the existing tooling, and compare their decisions.
+2. Set replication-manager to `failover-mode = "manual"` and replace its post-script with `examples/repman-failover-post-script-noop.sh`. Stop the bash guard.
+3. Run `mysql-guard migrate-key -to=legacy <guard flags>` once. This initialises `writer/epoch` and `writer/current` without changing the key value. `-dry-run` prints the result, and the command is refused in observe mode.
+4. Switch to `-mode=act`. Later, once every consumer understands `node|epoch`, you can run `migrate-key -to=epoch` and set `-master-format=epoch`.
+
+## Operations
+
+All CLI commands take the same flags as the daemon, in any position. Run them with the guard's own config on a DB host. In subcommands, give boolean flags as `-flag=true`.
+
+**Maintenance mode** (pauses every action; monitoring and alerts continue):
+
+```bash
+consul kv put mysql/<cluster>/guard/maintenance "<reason>"
+consul kv delete mysql/<cluster>/guard/maintenance
+```
+
+**Planned switchover:**
+
+```bash
+mysql-guard switchover <target-node> -cluster=<cluster> -peers=<db-a>,<db-b> -node=<this-node> -mode=act ...
+# "handover" is an alias. With no target, the last peer in -peers is used.
+```
+
+**Rejoin** an old primary as a replica (run on that node):
+
+```bash
+mysql-guard rejoin <source-node> ...flags...
+```
+
+If there are errant GTIDs, the node is marked `needs-rebuild` rather than re-pointed.
+
+**HTTP endpoints** (on `-http`, default `:9470`):
+
+| Path | Content |
 |---|---|
-| `switchover`, `failover`, `switchover-aborted`, `restore_writer`, `errant_gtid`, `needs-rebuild` | sent immediately, one per event |
-| replication-health codes above | held during a transition + 20s, then only after persisting `-repl-alert-delay` |
-| `fence` | folded into `failover` for the returning old primary; sent for any other fence |
-| `proxysql_writer_mismatch` (+ ok) | own grace; not raised while the primary is read-only (ProxySQL read_only monitor), which is the `primary_read_only` / `restore_writer` event |
-| `foreign_master_write` (+ cleared) | held during a transition + 20s; an aborted switchover leaves a `guard/key-repair` note and the leader rewrites the key at the new epoch |
+| `/` | Read-only web UI |
+| `/status` | JSON: primary, epoch, nodes (GTID, lag, stalled), guards, leader, last decision |
+| `/api/actions` | Action log |
+| `/metrics` | Prometheus metrics, e.g. `mysql_guard_would_act_total` |
+| `/healthz` | Liveness, always 200 |
 
-Drilled in `v030-drill.sh`: V3-V9 assert the exact alert list per event (after a 70s settle), V11a asserts no transient codes, V11b (stopped IO thread) and V11c (read-only primary) assert one alert after the delay.
+### Reading alerts
 
-### Switchover ordering: fence, catch up, then check (v0.3.1)
+Each ntfy alert has the title `mysql-guard <cluster>: <code>`. Each event produces one alert.
 
-GTID sets are compared only after the old primary is fenced. Order: (1) `super_read_only=ON` on the old primary and offline it in ProxySQL; open transactions get `-fence-drain-timeout` (default 3s) to finish, then their sessions are killed; (2) read the old primary's final `gtid_executed`; (3) wait for the target to apply it within `-switchover-catchup-timeout` (default 2x `-max-apply-lag`); (4) errant check: target minus source must be empty, and source minus target must be empty. If catch-up times out or the check fails, the switchover aborts before the epoch bump: the old primary is made writable again, ProxySQL is restored, the epoch and master key are unchanged, and `switchover-aborted` (or `errant_gtid`) is alerted. v0.3.0 compared snapshots read before the fence, so under writes a replica that applied a newer source transaction between the two reads was wrongly reported as having extra GTIDs. Failover is not affected: its gate reads only the candidate (received vs executed) and the dead primary takes no writes; the superset gate against the last published writer GTIDs can only fail safe (block until the next tick). Drilled under ~20 writes/s both ways and with a forced catch-up timeout (`v030-drill.sh` V9, V10).
+| Code | When |
+|---|---|
+| `failover`, `switchover`, `switchover-aborted`, `restore_writer`, `errant_gtid`, `needs-rebuild` | Sent immediately, once per event |
+| `repl_io_stopped`, `repl_sql_stopped`, `primary_read_only`, `read_only_drift`, `repl_lag`, `repl_stalled`, `repl_state_unknown` | Held while a switchover or failover is in progress (marker under 2 minutes old) and for 20s after it. After that, sent only once the condition has lasted `-repl-alert-delay`. For a fenced old primary waiting to rejoin, held for `-fence-followup-window` (30m), then sent once. |
+| `fence` | Sent for an unexpected writer. Fencing a returning old primary is folded into `failover`. |
+| `foreign_master_write` / `_cleared` | Something other than a guard wrote the master key (after 2 ticks) |
+| `proxysql_writer_mismatch` / `proxysql_writer_ok` | `-proxysql-verify` mismatch that lasted the grace period |
+| `writer_service_sync_failed` | The writer catalog service could not be updated (retried each leader tick) |
 
-### Switchover rollback after epoch bump (v0.3.0)
+If an alert persists, check `/status` and `/api/actions` first. A `needs-rebuild` node must be re-cloned from the primary. A `foreign_master_write` means another tool is still writing the key.
 
-Before the epoch CAS and master KV update, failed steps roll back (old primary writable, ProxySQL restored). If writing the master key fails **after** the epoch bump (3 attempts), the guard now aborts cleanly instead of leaving a half-done switchover: the new node is demoted (refused if it already has transactions the old primary lacks), re-pointed at the old primary, the old primary is made writable again and re-published at the bumped epoch, and `switchover-aborted` is alerted. If only the writer-service sync failed after the key was written, the switchover completes and the next leader tick retries the service. Drilled with a `-tags faultinject` build (`integration/scripts/v030-drill.sh` V4); release builds contain no fault hook.
+## Testing and drills
 
-### ProxySQL admin
+```bash
+go vet ./...
+go test ./...
+./integration/scripts/drill.sh             # docker-compose pair + witness, basic failover drills
+./integration/scripts/switchover-drill.sh  # switchover under load
+./integration/scripts/v030-drill.sh        # legacy key, writer service, ProxySQL verify, alert counts
+```
 
-Admin updates match `mysql_servers` rows by **hostname and port**. Map logical peer names to ProxySQL backends with `-proxysql-peer-endpoints` / `PROXYSQL_PEER_ENDPOINTS`, e.g. `db-a=10.0.0.1:3306,db-b=10.0.0.2:3306`. Unmapped peers use the peer name as hostname and port `3306`.
+The drills run MySQL, ProxySQL and Consul locally in Docker (`integration/docker-compose*.yml`). Fault injection for rollback paths needs `go build -tags faultinject`. Release builds contain no fault hooks.
 
-## Binary
+## Releases
 
-- **`mysql-guard`** — long-running guard (`--mode observe` by default)
-- **`mysql-guard switchover|handover <node>`** — planned handover (fence, catch-up, then errant check; see above)
-- **`mysql-guard rejoin <source>`** — errant check + auto-position vs needs-rebuild plan
-
-## Modes
-
-| Mode | Behaviour |
-|------|-----------|
-| `observe` | Full decision loop; log and metrics only (`mysql_guard_would_act_total`). Never writes cluster state (master key, epoch, `writer/current`, `writer/last-gtid`, writer service, MySQL `read_only`); still writes its own bookkeeping (instance heartbeats, actions log, leader lock) |
-| `fence` | Fence stray writers; no promotion |
-| `act` | Fence + promote + ProxySQL admin (when enabled) |
-
-## Key flags (see `--help`)
-
-| Flag | Default | Notes |
-|------|---------|--------|
-| `--mode` | `observe` | |
-| `--node` / `GUARD_NODE` | required | |
-| `--role` | `db` | `db` (promotable) or `witness` |
-| `--lag-gate-max-wait` | `0` | Never promote with missing GTIDs |
-| `--proxysql-admin-enable` | `false` | Admin hostgroup updates on promote/fence |
-| `--ntfy-url` | | Replication / errant / fence alerts |
-| `--repl-lag-alert-sec` | `30` | IO/SQL/lag/read_only drift alerts |
-| `--repl-alert-delay` | `45s` | replication-health alerts only after persisting this long and outside a switchover/failover window (`REPL_ALERT_DELAY`; old `--repl-thread-alert-delay` / `REPL_THREAD_ALERT_DELAY` still accepted) |
-| `--min-between-failovers` | `1h` | Rate limit between real failovers (writer moves to another node) |
-| `--read-only-grace` | `10s` | A reachable primary that stays read-only this long counts as failed (see below) |
-| Maintenance KV | | `mysql/<cluster>/guard/maintenance` — any value pauses actions |
-
-## v0.3.0: prod-compatibility features
-
-### Master key format and migration
-
-`-master-format` / `MASTER_FORMAT`:
-
-* `epoch` (default): `mysql/master/<cluster>` = `node|epoch`.
-* `legacy`: `mysql/master/<cluster>` = `host:port` exactly as the bash guard and the repman post-script write it; the epoch is kept in `mysql/<cluster>/writer/epoch` and `mysql/<cluster>/writer/current` = `node|epoch`.
-
-Both formats are always **read**. A legacy value is mapped to a node through `-mysql-peer-endpoints` (an unknown endpoint is an error, never a guess). Migration (always run with the guards' own flags):
-
-1. Deploy the guards in `-mode=observe` with `-master-format=legacy` next to the bash guard: they read the existing key and never write cluster state (master key, epoch, writer/current, writer/last-gtid, writer service, MySQL read_only). They do write their own bookkeeping under `mysql/<cluster>/guard/` and `mysql/<cluster>/actions` (instance heartbeats, actions log, leader lock), so the guard Consul policy needs write there even in observe.
-2. Stop the bash guard, then `mysql-guard migrate-key -to=legacy` once: initialises `writer/epoch` (1) and `writer/current` without changing the key value consumers read.
-3. Switch the guards to `-mode=act`, still legacy. Consumers keep reading `host:port`.
-4. Optional, after every consumer of the key understands `node|epoch`: `migrate-key -to=epoch`, then set `-master-format=epoch`. `migrate-key -to=legacy` reverts. `--dry-run` prints the target value; migration is a CAS on the key and is refused in observe mode.
-
-### Writer service
-
-`-writer-service=<name>` (e.g. `mysql-prod-writer`), `-writer-service-tags` (default `mysql,writer`). The leader registers a catalog service on node `<name>-vnode` pointing at the primary's endpoint, with Meta `cluster`, `node`, `epoch`, `promoted_by=mysql-guard` — the same shape as the bash guard's `mysql-prod-writer`. Synced after every SetMaster and every leader tick (idempotent); never in observe mode or under maintenance. Failure alerts `writer_service_sync_failed`. The guard's Consul policy needs `service "<name>" { policy = "write" }` and `node "<name>-vnode" { policy = "write" }`.
-
-### Repman: the guard is the sole promoter
-
-Run replication-manager in `failover-mode = "manual"` and replace its `failover-post-script` (`repman-failover-consul.sh`) with a no-op (`examples/repman-failover-post-script-noop.sh`), so only the guard writes `mysql/master/<cluster>` and the writer service. Repman stays useful for monitoring. Any write to the master key that the guard did not make (wrong epoch/node vs `writer/epoch` / `writer/current`, or a legacy value while in epoch mode) is alerted as `foreign_master_write` after 2 ticks (`-foreign-write-alert`, default on), and `foreign_master_write_cleared` once consistent.
-
-### ProxySQL verification
-
-Default unchanged: ProxySQL follows `read_only` (`mysql_replication_hostgroups`) and the guard never writes ProxySQL. `-proxysql-verify` with `-proxysql-admin-dsn` (the guard only runs `SELECT`s; ProxySQL has no read-only admin role, so give it a dedicated admin user) compares `runtime_mysql_servers` ONLINE rows in the writer hostgroup (`-proxysql-writer-hg`, 10) with the primary's `-proxysql-peer-endpoints` entry. A mismatch persisting `-proxysql-verify-grace` (20s) alerts `proxysql_writer_mismatch`, then `proxysql_writer_ok` when fixed. It only alerts; it never changes ProxySQL or the primary.
-
-### ntfy alerts
-
-`-ntfy-url` (`https://ntfy.sh/<topic>` or a self-hosted server), optional `-ntfy-token-file` (Bearer). Title `mysql-guard <cluster>: <code>`. Codes: `switchover`, `switchover-aborted`, `failover`, `restore_writer`, `fence`, `needs-rebuild`, `errant_gtid`, `*-degraded`, `foreign_master_write[_cleared]`, `proxysql_writer_mismatch` / `proxysql_writer_ok`, `writer_service_sync_failed`. Delivery failures are logged (`alert delivery failed`).
-
-### Remaining before production
-
-* Prod Consul policies: add the writer service/vnode write rules and `writer/` keys for the prod guard tokens.
-* Repman: switch the prod post-script to the no-op and confirm `failover-mode=manual` (needs Daniel).
-* ntfy: dedicated prod topic in prod Vault (exists for the bash guard) and a subscribed device; consider a token-protected self-hosted topic.
-* Shadow run: guards in observe + legacy beside the bash guard for an agreed period, comparing decisions, then the cut-over (stop bash guard, `migrate-key -to=legacy`, act).
-* Prod ProxySQL: a dedicated admin user (remote-capable, not `admin`) for `-proxysql-verify`.
-* Runbook for `switchover-aborted`, `foreign_master_write`, `needs-rebuild`.
-
-## Read-only primary (v0.2.8)
-
-A primary that is reachable but stays read-only for longer than `--read-only-grace`
-(for example after a restart whose init waits for the guard) counts as failed:
-
-- If its `gtid_executed` includes every reachable peer's set (and the last published
-  writer set for any unreachable peer), the leader makes it writable again:
-  STOP/RESET REPLICA, CAS epoch bump, master key `<same node>|<epoch+1>`, then
-  `super_read_only=OFF, read_only=OFF`. Action log: `restore_writer`.
-- Otherwise it fails over to a complete replica through the normal failover path
-  (stall and superset gates apply).
-
-Rate limit decision: `--min-between-failovers` applies only between real failovers.
-A writer restore is not a failover (the writer does not move, so it cannot flap
-between nodes), is not rate limited, and does not reset the failover timer. A
-failover caused by an incomplete read-only primary is a real failover and is rate
-limited. Maintenance mode blocks both.
+Releases are tagged `vX.Y.Z` on GitHub, with `linux-amd64` and `linux-arm64` tarballs plus `.sha256` files. The version is set with `-ldflags "-X main.version=<tag>"`. `make release` builds the amd64 tarball locally into `dist/`. The release notes describe what changed in each version.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-Credentials: `MYSQL_DSN`, `MYSQL_PASSWORD` / `MYSQL_PASSWORD_FILE`, `CONSUL_HTTP_TOKEN` / `CONSUL_TOKEN_FILE` (never logged).
-
-## Features in this draft
-
-| Area | Status |
-|------|--------|
-| Consul leader lock + renewal goroutine | Implemented (non-blocking session acquire) |
-| Epoch CAS + fenced KV markers | Implemented |
-| GTID gate + peer offset election | Implemented (GTID parser is simplified) |
-| Vote streaks (V1 probe wired; V2/V3 stubbed in health loop) | Partial |
-| ProxySQL admin on promote/fence | Implemented behind `--proxysql-admin-enable` |
-| Errant GTID before promote/rejoin | Implemented + unit tests |
-| Rejoin plan (auto-position vs needs-rebuild) | Implemented; SQL execution TODO |
-| Replication alerts → ntfy + Consul TTL checks | Implemented (needs `CONSUL_SERVICE_ID`) |
-| Maintenance mode KV | Implemented |
-| `/status` topology (primary, epoch, nodes, guards) | Implemented (guard discovery TODO) |
-| Embedded ops Web UI (`/`, `/api/actions`) | Implemented (read-only) |
-| Consul action log KV (`mysql/<cluster>/actions`) | Implemented |
-| Planned switchover / rejoin CLI | Implemented (local MySQL; multi-host orchestration limited) |
-| Consul events, full V2/V3 votes, rate-limit KV | TODO |
-| Nomad + Vault wiring | Example job only (`examples/nomad/mysql-guard.hcl`) |
-
-## Architecture (loops)
-
-- **Renewal** — Consul session / lock (`internal/consul/lock.go`), independent of MySQL probes
-- **Health** — probe interval, feeds vote streaks and replication alerts
-- **Leader-watch** — blocking KV watch on `mysql/<cluster>/guard/leader`
-
-## Rollout phases (from plan)
-
-0. Bash guard + optional V3 heartbeat fix in prod  
-1. **This repo** — unit tests + docker-compose drills  
-2. Nomad test namespace + G1–Gn drills  
-3. Prod observe beside bash guard  
-4. Act on staging  
-5. Prod act; retire bash guard and replication-manager  
-
-## Out of scope
-
-Backups, log collection, automatic replication error skipping.
-
-## Repository name
-
-The Go module path is `mysql-guard`. Rename the git remote/repository to `mysql-guard` in your forge when you create the repo (cloud agents cannot rename the remote).
-
-- `-repl-stmt-timeout` / `REPL_STMT_TIMEOUT` (default 30s): timeout for replication statements, with START REPLICA retry/backoff and post-drop state verification.
-- `-stall-after` / `STALL_AFTER` (default 30s, v0.2.6): a replica whose IO/SQL threads are ON but whose GTID gap to the writer has not shrunk for this long (including Retrieved_Gtid_Set empty while the writer advanced, e.g. a server_id equal to the events' originating server_id) is flagged `stalled` in `/status`, raises a `repl_stalled` critical alert, sets the guard TTL check to warning, and is never a failover candidate (action log step `stalled_candidate`). Automatic failover also refuses any candidate whose executed+retrieved set is not a superset of the last-known writer's executed set (`mysql/<cluster>/writer/last-gtid`, step `superset_gate`). GTID sets with a UUID repeated are now merged, not overwritten. Drill 10 covers this.
-- v0.2.7: the last-writer GTID key (`mysql/<cluster>/writer/last-gtid`) is republished by the leader until a write succeeds, instead of only on the tick that saw the change (which usually preceded leadership, so the key was never written). Drills 1 and 2 assert it.
+MIT. See [LICENSE](LICENSE).

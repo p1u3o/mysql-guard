@@ -29,3 +29,42 @@ func TestSubcommandClusterRequired(t *testing.T) {
 		t.Fatal("expected cluster required")
 	}
 }
+
+func TestSubcommandBoolFlagsDoNotSwallowTarget(t *testing.T) {
+	for _, b := range []string{"-mysql-tls", "--proxysql-verify", "--proxysql-admin-enable", "-foreign-write-alert"} {
+		cfg, target, err := LoadSubcommand([]string{"--cluster=prod", "--node=db-a", "--peers=db-a,db-b", b, "db-b"})
+		if err != nil {
+			t.Fatalf("%s: %v", b, err)
+		}
+		if target != "db-b" {
+			t.Fatalf("%s swallowed the target: target=%q", b, target)
+		}
+		_ = cfg
+	}
+	cfg, target, err := LoadSubcommand([]string{"rejoin-src", "-mysql-tls", "--proxysql-verify", "--cluster=prod", "--node=db-a", "--peers=db-a,db-b"})
+	if err != nil || target != "rejoin-src" || !cfg.MySQLTLS || !cfg.ProxySQLVerify {
+		t.Fatalf("target=%q tls=%v verify=%v err=%v", target, cfg != nil && cfg.MySQLTLS, cfg != nil && cfg.ProxySQLVerify, err)
+	}
+}
+
+func TestSubcommandBoolExplicitFalse(t *testing.T) {
+	cfg, target, err := LoadSubcommand([]string{"--cluster=prod", "--node=db-a", "--peers=db-a,db-b", "--foreign-write-alert=false", "db-b"})
+	if err != nil || target != "db-b" || cfg.ForeignWriteAlert {
+		t.Fatalf("target=%q fwa=%v err=%v", target, cfg.ForeignWriteAlert, err)
+	}
+}
+
+func TestSubcommandValueFlagStillTakesValue(t *testing.T) {
+	cfg, target, err := LoadSubcommand([]string{"--cluster", "prod", "--node", "db-a", "--peers", "db-a,db-b", "db-b"})
+	if err != nil || target != "db-b" || cfg.ClusterName != "prod" || cfg.NodeName != "db-a" {
+		t.Fatalf("target=%q err=%v", target, err)
+	}
+}
+
+func TestIsBoolFlag(t *testing.T) {
+	for n, want := range map[string]bool{"mysql-tls": true, "proxysql-verify": true, "proxysql-admin-enable": true, "foreign-write-alert": true, "cluster": false, "interval": false, "nope": false} {
+		if got := isBoolFlag(n); got != want {
+			t.Errorf("isBoolFlag(%q)=%v want %v", n, got, want)
+		}
+	}
+}

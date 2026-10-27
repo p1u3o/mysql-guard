@@ -317,7 +317,7 @@ job "mysql-guard-<cluster>" {
 
 ## Operations
 
-All CLI commands take the same flags as the daemon, in any position. Run them with the guard's own config on a DB host. In subcommands, give boolean flags as `-flag=true`.
+All CLI commands take the same flags as the daemon, in any position. Run them with the guard's own config on a DB host. Boolean flags take no value (`-mysql-tls`); use `-flag=false` to turn one off.
 
 **Maintenance mode** (pauses every action; monitoring and alerts continue):
 
@@ -347,7 +347,7 @@ If there are errant GTIDs, the node is marked `needs-rebuild` rather than re-poi
 |---|---|
 | `/` | Read-only web UI |
 | `/status` | JSON: primary, epoch, nodes (GTID, lag, stalled), guards, leader, last decision |
-| `/api/actions` | Action log |
+| `/api/actions` | Action log as a JSON array (`[]` when empty) |
 | `/metrics` | Prometheus metrics, e.g. `mysql_guard_would_act_total` |
 | `/healthz` | Liveness, always 200 |
 

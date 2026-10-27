@@ -1,6 +1,7 @@
 package config
 
 import (
+	"flag"
 	"fmt"
 	"strings"
 )
@@ -38,11 +39,22 @@ func needsFlagValue(name string) bool {
 	case "-h", "-help", "--help":
 		return false
 	}
-	// bool-style flags in our set use = form or are parsed by flag package as false default
-	if strings.HasPrefix(name, "--proxysql-admin-enable") {
+	n := strings.TrimLeft(name, "-")
+	return !isBoolFlag(n)
+}
+
+// isBoolFlag reports whether name is a boolean guard flag. Boolean flags never
+// consume the following argument (-mysql-tls rejoin db-a), matching the flag
+// package; give them an explicit value with -flag=false.
+func isBoolFlag(name string) bool {
+	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
+	defineFlags(fs, &Config{}, &rawFlags{})
+	f := fs.Lookup(name)
+	if f == nil {
 		return false
 	}
-	return true
+	bf, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && bf.IsBoolFlag()
 }
 
 // LoadSubcommand parses flags in any order and returns optional positional target.

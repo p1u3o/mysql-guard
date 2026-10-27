@@ -1,6 +1,6 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BINARY := mysql-guard
-DIST := dist/$(BINARY)-$(VERSION)-linux-amd64.tar.gz
+ARCHES := amd64 arm64
 
 .PHONY: build test vet release clean
 
@@ -13,13 +13,14 @@ test:
 vet:
 	go vet ./...
 
-release: $(DIST)
-
-$(DIST):
+release:
 	mkdir -p dist
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o dist/$(BINARY) ./cmd/mysql-guard
-	tar -C dist -czf $(DIST) $(BINARY)
-	cd dist && sha256sum $$(basename $(DIST)) > $$(basename $(DIST)).sha256
+	set -e; for arch in $(ARCHES); do \
+	  d=dist/$(BINARY)-$(VERSION)-linux-$$arch; rm -rf $$d; mkdir -p $$d; \
+	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch go build -trimpath -ldflags="-s -w -X main.version=$(VERSION)" -o $$d/$(BINARY) ./cmd/mysql-guard; \
+	  tar -C $$d -czf $$d.tar.gz $(BINARY); rm -rf $$d; \
+	done
+	cd dist && sha256sum $(BINARY)-$(VERSION)-linux-*.tar.gz > SHA256SUMS && cat SHA256SUMS
 
 clean:
 	rm -rf bin dist

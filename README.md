@@ -44,7 +44,7 @@ Latest release: **v0.3.4**. Releases are listed under [Releases](#releases).
              +----^------------------^------------------^-------+
                   |                  |                  |
           guard (db, node A)  guard (db, node B)  guard (witness)
-                  |                  |               (no MySQL)
+                  |                  |          (connect check only)
               MySQL A  ==async GTID==>  MySQL B
                   ^                  ^
                   +---- ProxySQL ----+   (follows read_only, or admin mode)
@@ -58,6 +58,47 @@ Roles, as set by `ChecksFor` in `internal/guard/runtime.go`:
 | `witness` | no | no | no | no |
 
 Each guard runs three independent loops: lock renewal (Consul session), health (probes, votes, alerts, leader decisions) and leader-watch.
+
+### Failover quorum
+
+A failover tick counts only with at least `-votes-needed` (default 2) votes; `-dead-after` must also pass and the primary must look dead on 3 consecutive ticks. Every voter needs a fresh heartbeat (at most 3 x `-interval` + 1s old) and must see the same primary. One vote each:
+
+| Voter | Vote "dead" when |
+|---|---|
+| each `db` guard (`<node>:probe`) | its MySQL probe of the primary fails |
+| the witness (`<witness>:witness`) | its MySQL connect check of the primary fails. A server that answers with an error (e.g. access denied) counts as alive. |
+| one replica IO vote (`<node>:io`) | a replica's IO thread lost the primary **and** the primary's own guard heartbeat is stale or missing **and** no fresh witness reports the primary reachable |
+
+The IO vote only counts when the whole primary host looks gone (its guard is silent too), so a replica that is merely cut off from the primary cannot fail it over: the fresh primary guard, or the witness, vetoes it. The IO vote may come from the same replica as a probe vote; that is what lets a two-node pair survive whole-host loss when the witness cannot probe MySQL. The voters behind each decision are in `/status` (`voters`) and in the failover alert (`votes: ...`).
+
+Then the existing gates still apply (lag/GTID gate, errant GTIDs, stall, `-min-between-failovers`, maintenance), plus the semi-sync gate.
+
+### Semi-sync
+
+Each guard reads the semi-sync variables and status (`rpl_semi_sync_source_*`, or the legacy `master`/`slave` names). The leader keeps the primary's last state in `mysql/<cluster>/guard/semisync`.
+
+- **Fallback to async** on the primary raises a `semisync_async` alert (after `-repl-alert-delay`; held during a failover follow-up).
+- **Failover alert** includes `semi-sync at loss: <sync|async|off|unknown> (last sample Ns before)`.
+- **Gate:** if semi-sync was enabled on the primary and it was last seen async, automatic failover is refused (logged `semisync_gate`, one alert per primary and epoch): acknowledged writes may exist only on the lost primary. Disable with `-semisync-gate=false`.
+- **Restore:** the promoted node gets semi-sync source OFF (no replica to acknowledge yet) and the record is marked pending. When a replica (re)joins, it gets replica ON before `START REPLICA`, and the source gets source ON once the replica is connected. The same happens at switchover.
+
+### Member service and health checks
+
+With `-member-service <svc>` (act mode only), the leader keeps one catalog entry per member, each on its own external node `<svc>-<node>-vnode`, pointing at the member's `host:port` from `-mysql-peer-endpoints`:
+
+| Tag | When | Check `<svc>:<node>:mysql` |
+|---|---|---|
+| `writer` | current primary | passing when writable; critical when unreachable or read-only |
+| `reader` | replica with both threads ON and lag <= `-member-max-lag` | passing |
+| `lagging` | replica lagging more than `-member-max-lag` | warning |
+| `fenced` | unreachable, replication stopped or broken, stalled, writable while not primary, or marked needs-rebuild | critical |
+
+Metadata: `cluster`, `node`, `epoch`, `role`. So `writer.<svc>.service.consul` and `reader.<svc>.service.consul` resolve to the writer and the healthy readers (DNS returns only passing and, by default, warning entries; `lagging`/`fenced` carry no `reader` tag). With `-writer-service`, the writer entry gets the same kind of check (`<writer-service>:mysql`); its behaviour is otherwise unchanged.
+
+- **Ordering:** writes happen only on the elected leader, and each write first re-reads the epoch and is skipped if it moved on. A promotion rewrites all entries at once in the same step as the writer key (new writer passing, every other member fenced); members return to `reader` once they replicate from the new primary.
+- **Debounce:** a role or status change must persist for `-member-check-delay` (10s) before it is written. Losing the primary, needs-rebuild and a writable non-primary are written immediately.
+- **If the leader dies:** catalog checks have no TTL, so two things keep them from staying passing forever. (1) The leader rewrites every check at least every 30s, and each check output begins `as-of=<time> epoch=<n> by=<leader> stale-after=90s:`, so anything older than 90s is stale. (2) The leader lock is a Consul session (`-session-ttl`), so another db guard takes over within that TTL and rewrites the checks from its own view. If no guard is alive at all, the entries keep their last state; monitor the `as-of` age.
+
 
 ### Consul key layout
 
@@ -123,6 +164,9 @@ Every option is a flag. Where an env var column has a value, the env var sets th
 | `-master-format` | `MASTER_FORMAT` | `epoch` | Write format of `mysql/master/<cluster>`: `epoch` or `legacy`. Reads always accept both. |
 | `-writer-service` | `WRITER_SERVICE` | (off) | Name of the catalog service kept pointing at the writer |
 | `-writer-service-tags` | `WRITER_SERVICE_TAGS` | `mysql,writer` | Tags for that service |
+| `-member-service` | `MEMBER_SERVICE` | (off) | Catalog service with one entry per member (see *Member service*) |
+| `-member-max-lag` | `MEMBER_MAX_LAG` | `30` | Seconds of lag above which a replica is `lagging` (check warning, out of reader DNS) |
+| `-member-check-delay` | `MEMBER_CHECK_DELAY` | `10s` | A member role/check change must persist this long before it is written. Promotion and fencing are immediate. |
 | `-action-log-max` | | `500` | Maximum entries in `mysql/<cluster>/actions` |
 
 ### Detection and failover
@@ -137,9 +181,13 @@ Every option is a flag. Where an env var column has a value, the env var sets th
 | `-min-between-failovers` | | `1h` | Minimum time between real failovers |
 | `-max-apply-lag` | | `30s` | Time allowed to apply retrieved GTIDs |
 | `-lag-gate-max-wait` | | `0` | Maximum wait for missing GTIDs. `0` = never promote while GTIDs are missing. |
-| `-fence-grace` | | `30s` | Grace period before fencing a node marked as sole writer |
+| `-fence-grace` | | | **Removed in v0.3.6.** It never had an effect; the flag is still accepted (and ignored) so old job files keep starting. |
 | `-read-only-grace` | | `10s` | A reachable primary that is read-only for this long counts as failed (restored if its data is complete, otherwise failover) |
-| `-replica-stale` | | `35s` | Staleness threshold for heartbeat and last-queued transaction |
+| `-replica-stale` | | `35s` | Replica IO vote: the IO thread has lost the primary when it is connecting/erroring, or has received no event or heartbeat for this long. Set `SOURCE_HEARTBEAT_PERIOD` well below it. |
+| `-witness-probe` | `WITNESS_PROBE` | `true` | Witness: MySQL connect check of the primary with the `-mysql-user` login (a read-only `mg_*` user is enough). Without credentials the witness does not vote. |
+| `-semisync-gate` | `SEMISYNC_GATE` | `true` | Refuse automatic failover when semi-sync was enabled on the primary but it was last seen running async |
+| `-semisync-restore` | `SEMISYNC_RESTORE` | `true` | Re-enable semi-sync after a failover, switchover or rejoin when it was on before |
+| `-repl-source-ssl` | `REPL_SOURCE_SSL` | `true` | `CHANGE REPLICATION SOURCE ... SOURCE_SSL=1` |
 | `-stall-after` | `STALL_AFTER` | `30s` | A replica whose threads are ON but whose GTID gap does not shrink for this long is `stalled`. It raises an alert and is never a candidate. |
 | `-fence-drain-timeout` | `FENCE_DRAIN_TIMEOUT` | `3s` | Switchover: wait for open transactions on the fenced source, then kill them |
 | `-switchover-catchup-timeout` | `SWITCHOVER_CATCHUP_TIMEOUT` | `0` (= 2x `-max-apply-lag`) | Switchover: maximum wait for the target to catch up |
@@ -172,7 +220,9 @@ Boolean env vars accept `1`, `true` or `yes`.
 
 ## Required MySQL grants and Consul policy
 
-### MySQL (guard user, on every DB node; the witness needs none)
+### MySQL (guard user, on every DB node)
+
+The witness needs only a login that can connect (`USAGE`, e.g. the read-only `mg_*` user) for its connect check; without one it does not vote.
 
 The examples below use placeholders (`<guard-user>`, `<host>`).
 
@@ -216,7 +266,10 @@ key_prefix "mysql/master/<cluster>"  { policy = "write" }
 key_prefix "mysql/<cluster>/writer/" { policy = "write" }
 # only if -writer-service is set:
 service "<writer-service>"      { policy = "write" }
-node    "<writer-service>-vnode" { policy = "write" }
+node    "<writer-service>-vnode" { policy = "write" }   # also covers the <writer-service>:mysql check
+# only if -member-service is set:
+service     "<member-service>"  { policy = "write" }
+node_prefix "<member-service>-" { policy = "write" }   # vnodes <member-service>-<node>-vnode and their checks
 ```
 
 ## Deploying with Nomad
@@ -374,13 +427,14 @@ go test ./...
 ./integration/scripts/drill.sh             # docker-compose pair + witness, basic failover drills
 ./integration/scripts/switchover-drill.sh  # switchover under load
 ./integration/scripts/v030-drill.sh        # legacy key, writer service, ProxySQL verify, alert counts
+./integration/scripts/v036-drill.sh        # D1-D5: host loss, partitions, witness loss, semi-sync, member DNS
 ```
 
 The drills run MySQL, ProxySQL and Consul locally in Docker (`integration/docker-compose*.yml`). Fault injection for rollback paths needs `go build -tags faultinject`. Release builds contain no fault hooks.
 
 ## Releases
 
-Releases are tagged `vX.Y.Z` on GitHub, with `linux-amd64` and `linux-arm64` tarballs plus `.sha256` files. The version is set with `-ldflags "-X main.version=<tag>"`. `make release` builds the amd64 tarball locally into `dist/`. The release notes describe what changed in each version.
+Releases are tagged `vX.Y.Z` on GitHub, with `linux-amd64` and `linux-arm64` tarballs plus `.sha256` files. The version is set with `-ldflags "-X main.version=<tag>"`. `make release` builds the linux amd64 and arm64 tarballs into `dist/` with a `SHA256SUMS` file. The release notes describe what changed in each version.
 
 ## License
 

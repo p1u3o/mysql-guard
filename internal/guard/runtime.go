@@ -252,7 +252,7 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 			r.mu.RLock()
 			replSt.StallReason, replSt.Stalled = r.stalled[r.cfg.NodeName], r.stalled[r.cfg.NodeName] != ""
 			r.mu.RUnlock()
-			if !r.gateHolding(primary, epochKV) && !r.recoveryHolding(now) {
+			if !r.gateHolding(primary, epochKV) && !(replSt.ExpectReadOnly && r.recoveryHolding(now)) { // v0.3.7 hold applies to the replica only
 				r.exec.PublishReplicationAlerts(ctx, replSt)
 			}
 		}

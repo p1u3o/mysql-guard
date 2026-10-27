@@ -40,6 +40,10 @@ Open `http://<listen>/` on the same `-http` address. The dashboard polls `/statu
 
 `-mysql-peer-endpoints` / `MYSQL_PEER_ENDPOINTS` (`db-a=host:port,db-b=host:port`) with shared `-mysql-user` and password file. Optional `-mysql-tls` and `-mysql-ca-file`. Switchover/rejoin and `/status` cluster view use these connections (local DSN remains fallback for this node).
 
+### Replica-thread alerts during transitions (v0.3.2)
+
+A switchover or failover writes a transition marker to `mysql/<cluster>/guard/transition` (action, from, to, started, ended). Every guard holds back `repl_io_stopped` and `repl_sql_stopped` while the marker is active (not ended and under 2 minutes old) and for 20s after it ends, and in any case raises them only after the condition has lasted `-repl-thread-alert-delay` (default 45s). A planned switchover or a failover therefore sends one alert (`switchover` or `failover`), not three. A replica thread that really stays stopped still alerts once after the delay. Other replication alerts (lag, stall, read_only drift) are unchanged. Drilled in `v030-drill.sh` V11a/V11b.
+
 ### Switchover ordering: fence, catch up, then check (v0.3.1)
 
 GTID sets are compared only after the old primary is fenced. Order: (1) `super_read_only=ON` on the old primary and offline it in ProxySQL; open transactions get `-fence-drain-timeout` (default 3s) to finish, then their sessions are killed; (2) read the old primary's final `gtid_executed`; (3) wait for the target to apply it within `-switchover-catchup-timeout` (default 2x `-max-apply-lag`); (4) errant check: target minus source must be empty, and source minus target must be empty. If catch-up times out or the check fails, the switchover aborts before the epoch bump: the old primary is made writable again, ProxySQL is restored, the epoch and master key are unchanged, and `switchover-aborted` (or `errant_gtid`) is alerted. v0.3.0 compared snapshots read before the fence, so under writes a replica that applied a newer source transaction between the two reads was wrongly reported as having extra GTIDs. Failover is not affected: its gate reads only the candidate (received vs executed) and the dead primary takes no writes; the superset gate against the last published writer GTIDs can only fail safe (block until the next tick). Drilled under ~20 writes/s both ways and with a forced catch-up timeout (`v030-drill.sh` V9, V10).
@@ -77,6 +81,7 @@ Admin updates match `mysql_servers` rows by **hostname and port**. Map logical p
 | `--proxysql-admin-enable` | `false` | Admin hostgroup updates on promote/fence |
 | `--ntfy-url` | | Replication / errant / fence alerts |
 | `--repl-lag-alert-sec` | `30` | IO/SQL/lag/read_only drift alerts |
+| `--repl-thread-alert-delay` | `45s` | IO/SQL thread-stopped alerts only after persisting this long and outside a switchover/failover window (`REPL_THREAD_ALERT_DELAY`) |
 | `--min-between-failovers` | `1h` | Rate limit between real failovers (writer moves to another node) |
 | `--read-only-grace` | `10s` | A reachable primary that stays read-only this long counts as failed (see below) |
 | Maintenance KV | | `mysql/<cluster>/guard/maintenance` — any value pauses actions |

@@ -247,7 +247,7 @@ log "=== V9: switchover under continuous writes (both ways, v0.3.1 fence/catch-u
 LOADTAB="CREATE TABLE IF NOT EXISTS drill.load (id BIGINT AUTO_INCREMENT PRIMARY KEY, tag VARCHAR(16), ts TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3))"
 px "$LOADTAB" || sqlq db-a "$LOADTAB"
 load_start() { # 3 writer loops, single-row commits through ProxySQL (target 20-50/s total)
-  for i in 1 2 3; do
+  for i in 1 2 3 4; do
     docker compose exec -T -d db-b bash -c "echo \$\$ >> /tmp/load.pid; while :; do mysql -h proxysql -P6033 -uroot -pplaceholder -N -B -e \"INSERT INTO drill.load (tag) VALUES ('$1')\" 2>/dev/null; sleep 0.1; done"
   done
   sleep 1
@@ -276,6 +276,12 @@ for dir in "db-a db-b guard-a" "db-b db-a guard-b"; do
   pass "V9: switchover $FROM->$TO under ~${RATE} writes/s ($N rows, identical on both), epoch $E->$(kv_epoch), no errant/abort alert"
 done
 
+log "=== V11a: no replica-thread alerts from planned switchovers / failover (V3-V9) ==="
+RIO=$(alert_n repl_io_stopped); RSQL=$(alert_n repl_sql_stopped)
+[ "$RIO$RSQL" = 00 ] || fail "replica-thread alerts during transitions: io=$RIO sql=$RSQL"
+log "alerts so far: $(alerts | sort | uniq -c | tr '\n' ';')"
+pass "V11a: switchovers/failover produced 0 repl_io_stopped / repl_sql_stopped alerts"
+
 log "=== V10: catch-up timeout -> clean abort, source writable, epoch unchanged ==="
 primary_is db-a || fail "precondition primary db-a"
 E=$(kv_epoch); AB=$(alert_n switchover-aborted); S=$(alert_n switchover)
@@ -296,6 +302,16 @@ wait_for 30 "v10 rows on db-b" row_on db-b v10-after; wait_for 30 "GTIDs match" 
 sleep 8; primary_is db-a || fail "primary moved after abort"
 snap v10-catchup-abort
 pass "V10: catch-up timeout aborted cleanly: db-a writable, epoch $E unchanged, ProxySQL restored, one abort alert"
+
+log "=== V11b: a real replica IO stop still alerts exactly once (after the hold delay) ==="
+primary_is db-a || fail "precondition primary db-a"
+RIO=$(alert_n repl_io_stopped)
+sqlq db-b "STOP REPLICA IO_THREAD"
+sleep 20; [ "$(alert_n repl_io_stopped)" = "$RIO" ] || fail "IO alert before hold delay"
+wait_for 90 "repl_io_stopped alert" alert_gt repl_io_stopped "$RIO"
+sleep 15; [ "$(alert_n repl_io_stopped)" = "$((RIO+1))" ] || fail "expected exactly one repl_io_stopped alert, got $(( $(alert_n repl_io_stopped) - RIO ))"
+sqlq db-b "START REPLICA IO_THREAD"; wait_for 30 "db-b replicating" replica_running db-b; wait_for 30 "GTIDs match" gtids_match
+pass "V11b: persistent IO stop alerted once after the delay"
 
 SK=$(count_skipped); [ "$SK" = 0 ] || fail "$SK skipped action entries"
 two_writers && fail "TWO WRITERS at end"

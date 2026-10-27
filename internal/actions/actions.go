@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"mysql-guard/internal/config"
 	"mysql-guard/internal/consul"
@@ -34,6 +35,7 @@ type Executor struct {
 	replMu      sync.Mutex
 	replInit    bool
 	lastReplKey string
+	replFirst   map[string]time.Time
 }
 
 func NewExecutor(cfg *config.Config, log *slog.Logger, my *mysql.Prober, peers *mysql.Pool, px *proxysql.Client, store *consul.Store, alerts *notify.Fanout) *Executor {
@@ -147,6 +149,19 @@ func (e *Executor) RunScenario(ctx context.Context, res decision.ScenarioResult,
 
 func (e *Executor) PublishReplicationAlerts(ctx context.Context, st replhealth.State) {
 	alerts := replhealth.Evaluate(st, replhealth.Config{MaxLagSeconds: e.cfg.ReplLagAlertSec})
+	held := false
+	for _, a := range alerts {
+		if isThreadCode(a.Code) {
+			held = e.transitionHeld(ctx)
+			break
+		}
+	}
+	e.replMu.Lock()
+	if e.replFirst == nil {
+		e.replFirst = map[string]time.Time{}
+	}
+	alerts = filterThreadAlerts(alerts, e.replFirst, held, e.cfg.ReplThreadAlertDelay, time.Now())
+	e.replMu.Unlock()
 	if !e.replAlertsChanged(alerts) {
 		return
 	}

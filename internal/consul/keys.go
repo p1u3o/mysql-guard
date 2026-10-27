@@ -27,3 +27,7 @@ func (k KeyPaths) Maintenance() string { return fmt.Sprintf("mysql/%s/guard/main
 func (k KeyPaths) NeedsRebuild(node string) string {
 	return fmt.Sprintf("mysql/%s/guard/needs-rebuild/%s", k.Cluster, node)
 }
+
+// Transition marks a switchover or failover in progress (cluster-visible, so
+// every guard can hold back replica-thread alerts caused by the transition).
+func (k KeyPaths) Transition() string { return fmt.Sprintf("mysql/%s/guard/transition", k.Cluster) }

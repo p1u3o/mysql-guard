@@ -58,6 +58,7 @@ func (e *Executor) Failover(ctx context.Context, oldPrimary, candidate string, e
 	if err != nil {
 		return err
 	}
+	defer e.markTransition(ctx, "failover", oldPrimary, candidate)()
 	e.actionLog(ctx, epoch, "failover", reason, "ok", "begin")
 	st, err := e.peers.ReadState(ctx, candidate)
 	if err != nil {

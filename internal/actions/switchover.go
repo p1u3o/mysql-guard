@@ -37,6 +37,7 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 		return err
 	}
 	e.actionLog(ctx, 0, "switchover", "starting", "ok", "begin")
+	defer e.markTransition(ctx, "switchover", oldPrimary, newPrimary)()
 	rolled := false
 	rollback := func() {
 		if rolled {

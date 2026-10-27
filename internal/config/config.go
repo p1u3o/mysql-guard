@@ -90,11 +90,12 @@ type Config struct {
 	ProxySQLWriterHG         int
 	ProxySQLReaderHG         int
 
-	NtfyURL           string
-	ReplLagAlertSec   float64
-	StallAfter        time.Duration
-	ConsulServiceID   string
-	ConsulServiceName string
+	NtfyURL              string
+	ReplLagAlertSec      float64
+	ReplThreadAlertDelay time.Duration
+	StallAfter           time.Duration
+	ConsulServiceID      string
+	ConsulServiceName    string
 
 	ActionLogMax int
 
@@ -145,33 +146,34 @@ func Load(args []string) (*Config, error) {
 	fs.SetOutput(os.Stderr)
 
 	c := &Config{
-		Mode:               ModeObserve,
-		Interval:           2 * time.Second,
-		ProbeTimeout:       3 * time.Second,
-		SlowThreshold:      4,
-		DeadAfter:          30 * time.Second,
-		VotesNeeded:        2,
-		SessionTTL:         15 * time.Second,
-		LockDelay:          15 * time.Second,
-		MinBetweenFail:     time.Hour,
-		MaxApplyLag:        30 * time.Second,
-		FenceDrainTimeout:  3 * time.Second,
-		LagGateMaxWait:     0,
-		FenceGrace:         30 * time.Second,
-		ReadOnlyGrace:      10 * time.Second,
-		ReplicaStale:       35 * time.Second,
-		ProxySQLMode:       ProxySQLMonitor,
-		ProxySQLWriterHG:   10,
-		ProxySQLReaderHG:   11,
-		ReplLagAlertSec:    30,
-		StallAfter:         30 * time.Second,
-		HTTPListen:         ":9470",
-		ConsulAddr:         "127.0.0.1:8500",
-		MySQLPort:          3306,
-		ReplConnectTimeout: 30 * time.Second,
-		ReplStmtTimeout:    30 * time.Second,
-		ConsulServiceName:  "mysql-guard",
-		ActionLogMax:       500,
+		Mode:                 ModeObserve,
+		Interval:             2 * time.Second,
+		ProbeTimeout:         3 * time.Second,
+		SlowThreshold:        4,
+		DeadAfter:            30 * time.Second,
+		VotesNeeded:          2,
+		SessionTTL:           15 * time.Second,
+		LockDelay:            15 * time.Second,
+		MinBetweenFail:       time.Hour,
+		MaxApplyLag:          30 * time.Second,
+		FenceDrainTimeout:    3 * time.Second,
+		LagGateMaxWait:       0,
+		FenceGrace:           30 * time.Second,
+		ReadOnlyGrace:        10 * time.Second,
+		ReplicaStale:         35 * time.Second,
+		ProxySQLMode:         ProxySQLMonitor,
+		ProxySQLWriterHG:     10,
+		ProxySQLReaderHG:     11,
+		ReplLagAlertSec:      30,
+		ReplThreadAlertDelay: 45 * time.Second,
+		StallAfter:           30 * time.Second,
+		HTTPListen:           ":9470",
+		ConsulAddr:           "127.0.0.1:8500",
+		MySQLPort:            3306,
+		ReplConnectTimeout:   30 * time.Second,
+		ReplStmtTimeout:      30 * time.Second,
+		ConsulServiceName:    "mysql-guard",
+		ActionLogMax:         500,
 	}
 
 	var peers string
@@ -218,6 +220,7 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&c.NtfyURL, "ntfy-url", envOr("NTFY_URL", ""), "ntfy topic URL for alerts")
 	fs.DurationVar(&c.StallAfter, "stall-after", envDuration("STALL_AFTER", c.StallAfter), "replica with threads ON whose GTID gap to the writer does not shrink for this long is stalled (alert, warning check, never a promotion candidate)")
 	fs.Float64Var(&c.ReplLagAlertSec, "repl-lag-alert-sec", c.ReplLagAlertSec, "replication lag alert threshold")
+	fs.DurationVar(&c.ReplThreadAlertDelay, "repl-thread-alert-delay", envDuration("REPL_THREAD_ALERT_DELAY", c.ReplThreadAlertDelay), "repl_io_stopped/repl_sql_stopped alert only after persisting this long and outside a switchover/failover window")
 	fs.StringVar(&c.ConsulServiceID, "consul-service-id", envOr("CONSUL_SERVICE_ID", ""), "register this agent service id and publish TTL checks (recommended)")
 	fs.StringVar(&c.ConsulServiceName, "consul-service-name", envOr("CONSUL_SERVICE_NAME", c.ConsulServiceName), "Consul service name when registering")
 	fs.StringVar(&proxysqlPeers, "proxysql-peer-endpoints", envOr("PROXYSQL_PEER_ENDPOINTS", ""), "peer=host:port map for ProxySQL mysql_servers matching (comma-separated)")

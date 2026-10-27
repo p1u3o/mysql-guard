@@ -52,7 +52,12 @@ func TestQuorumScenarios(t *testing.T) {
 		{"witness alone", QuorumInput{Self: R, SelfPrimaryOK: true, Primary: P, Guards: []consul.GuardInstance{primaryGuard(true), witness("dead")}}, 1, "prod02:witness"},
 		{"stale witness ignored", QuorumInput{Self: R, SelfPrimaryOK: false, Primary: P, Guards: []consul.GuardInstance{primaryGuard(true), func() consul.GuardInstance { x := witness("dead"); x.LastHeartbeat = time.Unix(0, 0); return x }()}}, 1, "kv02:probe"},
 		{"witness about another primary ignored", QuorumInput{Self: R, SelfPrimaryOK: false, Primary: P, Guards: []consul.GuardInstance{func() consul.GuardInstance { x := witness("dead"); x.PrimaryView = R; return x }()}}, 1, "kv02:probe"},
-		{"leader is primary guard, mysqld down", QuorumInput{Self: P, SelfPrimaryOK: false, Primary: P, Guards: []consul.GuardInstance{func() consul.GuardInstance { x := g(R, "db", time.Second, P); x.PrimaryOK = false; x.ReplicaIOLost = true; return x }()}}, 2, "kv01:probe,kv02:probe"},
+		{"leader is primary guard, mysqld down", QuorumInput{Self: P, SelfPrimaryOK: false, Primary: P, Guards: []consul.GuardInstance{func() consul.GuardInstance {
+			x := g(R, "db", time.Second, P)
+			x.PrimaryOK = false
+			x.ReplicaIOLost = true
+			return x
+		}()}}, 2, "kv01:probe,kv02:probe"},
 		{"healthy", QuorumInput{Self: R, SelfPrimaryOK: true, Primary: P, Guards: []consul.GuardInstance{primaryGuard(true), witness("ok")}}, 0, "no votes"},
 	}
 	for _, c := range cases {

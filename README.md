@@ -80,7 +80,7 @@ Each guard reads the semi-sync variables and status (`rpl_semi_sync_source_*`, o
 - **Fallback to async** on the primary raises a `semisync_async` alert (after `-repl-alert-delay`; held during a failover follow-up).
 - **Failover alert** includes `semi-sync at loss: <sync|async|off|unknown> (last sample Ns before)`.
 - **Gate:** if semi-sync was enabled on the primary and it was last seen async, automatic failover is refused (logged `semisync_gate`, one alert per primary and epoch): acknowledged writes may exist only on the lost primary. Disable with `-semisync-gate=false`.
-- **Restore:** the promoted node gets semi-sync source OFF (no replica to acknowledge yet) and the record is marked pending. When a replica (re)joins, it gets replica ON before `START REPLICA`, and the source gets source ON once the replica is connected. The same happens at switchover.
+- **Restore:** the promoted node gets semi-sync source OFF (no replica to acknowledge yet) and the record is marked pending. When a replica (re)joins, it gets replica ON before `START REPLICA`, and the source gets source ON once the replica is connected. The same happens at switchover whenever the cluster runs semi-sync (the record says enabled or pending, or either node has source enabled).
 
 ### Member service and health checks
 
@@ -90,10 +90,10 @@ With `-member-service <svc>` (act mode only), the leader keeps one catalog entry
 |---|---|---|
 | `writer` | current primary | passing when writable; critical when unreachable or read-only |
 | `reader` | replica with both threads ON and lag <= `-member-max-lag` | passing |
-| `lagging` | replica lagging more than `-member-max-lag` | warning |
+| `lagging` | replica lagging more than `-member-max-lag` (`Seconds_Behind_Source`) | warning |
 | `fenced` | unreachable, replication stopped or broken, stalled, writable while not primary, or marked needs-rebuild | critical |
 
-Metadata: `cluster`, `node`, `epoch`, `role`. So `writer.<svc>.service.consul` and `reader.<svc>.service.consul` resolve to the writer and the healthy readers (DNS returns only passing and, by default, warning entries; `lagging`/`fenced` carry no `reader` tag). With `-writer-service`, the writer entry gets the same kind of check (`<writer-service>:mysql`); its behaviour is otherwise unchanged.
+Metadata: `cluster`, `node`, `epoch`, `role`. So `writer.<svc>.service.consul` and `reader.<svc>.service.consul` resolve to the writer and the healthy readers (DNS returns only passing and, by default, warning entries; `lagging`/`fenced` carry no `reader` tag). With `-writer-service`, the writer entry gets the same kind of check (`<writer-service>:mysql`); its behaviour is otherwise unchanged. In the tick that changes the writer (failover or seed), the writer and member entries are not rewritten; the next tick publishes the new topology, so the old primary is never re-published.
 
 - **Ordering:** writes happen only on the elected leader, and each write first re-reads the epoch and is skipped if it moved on. A promotion rewrites all entries at once in the same step as the writer key (new writer passing, every other member fenced); members return to `reader` once they replicate from the new primary.
 - **Debounce:** a role or status change must persist for `-member-check-delay` (10s) before it is written. Losing the primary, needs-rebuild and a writable non-primary are written immediately.
@@ -188,7 +188,7 @@ Every option is a flag. Where an env var column has a value, the env var sets th
 | `-semisync-gate` | `SEMISYNC_GATE` | `true` | Refuse automatic failover when semi-sync was enabled on the primary but it was last seen running async |
 | `-semisync-restore` | `SEMISYNC_RESTORE` | `true` | Re-enable semi-sync after a failover, switchover or rejoin when it was on before |
 | `-repl-source-ssl` | `REPL_SOURCE_SSL` | `true` | `CHANGE REPLICATION SOURCE ... SOURCE_SSL=1` |
-| `-stall-after` | `STALL_AFTER` | `30s` | A replica whose threads are ON but whose GTID gap does not shrink for this long is `stalled`. It raises an alert and is never a candidate. |
+| `-stall-after` | `STALL_AFTER` | `30s` | A replica whose threads are ON but whose GTID gap does not shrink for this long is `stalled`. It raises an alert and is never a candidate. A replica that keeps applying transactions (a delayed or steadily lagging replica) is lag, not a stall. |
 | `-fence-drain-timeout` | `FENCE_DRAIN_TIMEOUT` | `3s` | Switchover: wait for open transactions on the fenced source, then kill them |
 | `-switchover-catchup-timeout` | `SWITCHOVER_CATCHUP_TIMEOUT` | `0` (= 2x `-max-apply-lag`) | Switchover: maximum wait for the target to catch up |
 

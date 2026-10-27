@@ -29,7 +29,7 @@ Latest release: **v0.3.4**. Releases are listed under [Releases](#releases).
 
 ## What it does NOT do
 
-- No Group Replication, InnoDB Cluster, semi-sync management, or setups with more than one writer. It handles async GTID replication only.
+- No Group Replication, InnoDB Cluster, or setups with more than one writer. It handles async and semi-sync GTID replication (semi-sync is monitored, gated and restored after failover/switchover; see Semi-sync).
 - No backups, rebuilds or clones. A `needs-rebuild` node has to be rebuilt by hand.
 - It does not skip replication errors automatically.
 - In **`observe` mode** (the default), it never writes cluster state: no master key, epoch, `writer/current`, `writer/last-gtid`, writer service, MySQL `read_only`, or ProxySQL. It still runs the full decision loop and logs what it would do (`mysql_guard_would_act_total`). It does write its own bookkeeping: the leader lock/session, instance heartbeats and the action log.
@@ -81,6 +81,7 @@ Each guard reads the semi-sync variables and status (`rpl_semi_sync_source_*`, o
 - **Failover alert** includes `semi-sync at loss: <sync|async|off|unknown> (last sample Ns before)`.
 - **Gate:** if semi-sync was enabled on the primary and it was last seen async, automatic failover is refused (logged `semisync_gate`, one alert per primary and epoch): acknowledged writes may exist only on the lost primary. Disable with `-semisync-gate=false`.
 - **Restore:** the promoted node gets semi-sync source OFF (no replica to acknowledge yet) and the record is marked pending. When a replica (re)joins, it gets replica ON before `START REPLICA`, and the source gets source ON once the replica is connected. The same happens at switchover whenever the cluster runs semi-sync (the record says enabled or pending, or either node has source enabled).
+- **Restart without failover:** the guard does not re-enable semi-sync on a primary whose mysqld restarted in place; set `rpl_semi_sync_source_enabled`/`rpl_semi_sync_replica_enabled` in my.cnf (or `SET PERSIST`) so a restarted node comes back with its semi-sync settings. Until then `semisync_async` stays raised.
 
 ### Member service and health checks
 

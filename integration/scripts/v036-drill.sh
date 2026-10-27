@@ -241,6 +241,8 @@ primary_key_is db-a || fail "D5b: failover happened despite the semi-sync gate"
 EV_WAIT=0 ev_check "D5b gate" failover_blocked
 alert_msgs failover_blocked | tail -1 | grep -q 'semi-sync' || fail "D5b blocked alert text"
 host_start a
+# a restarted mysqld takes semi-sync from its config (my.cnf in prod); the drill runs it from flags, so set it as my.cnf would
+sqlq db-a "SET GLOBAL rpl_semi_sync_source_enabled=ON"
 sqlq db-b "SET GLOBAL rpl_semi_sync_replica_enabled=ON; STOP REPLICA IO_THREAD; START REPLICA IO_THREAD"
 wait_for 60 "D5b semi-sync back" semi_sync_on db-a
 writes_land_on db-a d5b-after

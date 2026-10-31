@@ -92,19 +92,13 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 	}
 	e.actionLog(ctx, 0, "switchover", "target caught up to fenced source; no errant GTIDs", "ok", "gtid_gate")
 	if err := newAdm.StopReplica(ctx); err != nil {
-		e.actionLog(ctx, 0, "switchover", err.Error(), "error", "stop_replica")
-		rollback()
-		return err
+		return abort("stop_replica", err)
 	}
 	if err := newAdm.ResetReplicaAll(ctx); err != nil {
-		e.actionLog(ctx, 0, "switchover", err.Error(), "error", "reset_replica")
-		rollback()
-		return err
+		return abort("reset_replica", err)
 	}
 	if err := newAdm.PromoteWritable(ctx); err != nil {
-		e.actionLog(ctx, 0, "switchover", err.Error(), "error", "promote_writable")
-		rollback()
-		return err
+		return abort("promote_writable", err)
 	}
 	epoch, _ := e.store.GetEpoch(ctx)
 	newEpoch, err := e.store.CasBumpEpoch(ctx, epoch)

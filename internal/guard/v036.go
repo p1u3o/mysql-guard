@@ -45,6 +45,12 @@ func (r *Runtime) sampleSemiSync(ctx context.Context, now time.Time, primary str
 	if rec != nil && rec.Pending && !po.st.SemiSync.SourceEnabled {
 		nr.Enabled, nr.Pending, nr.StallDisabled = true, true, rec.StallDisabled // restore still owed at rejoin or stall re-enable
 	}
+	if rec != nil && rec.StallDisabled && po.st.SemiSync.SourceEnabled {
+		// The operator turned the source back on while the guard still owed a
+		// re-enable: the new record below ends that duty. Say so.
+		r.log.Info("semi-sync stall", "primary", primary, "action", "clear", "decision", "source turned on by the operator; stall record cleared")
+		r.exec.LogAction(ctx, epoch, "semisync_stall", "source semi-sync turned on by the operator on "+primary+"; stall record cleared", "ok", "clear")
+	}
 	if err := r.store.PutSemiSync(ctx, nr); err != nil {
 		r.log.Warn("semisync kv write", "err", err)
 	}

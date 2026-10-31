@@ -1,0 +1,14 @@
+# v0.3.8 drills: semi-sync stall handling and the switchover command.
+# Use with: docker compose -f docker-compose.yml -f docker-compose.v030.yml -f docker-compose.v036.yml -f docker-compose.v038.yml
+# The replica variable is set in the server arguments so it survives a real mysqld restart.
+services:
+  db-a:
+    command: ["--server-id=1", "--log-bin=mysql-bin", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--plugin-load-add=semisync_source.so", "--plugin-load-add=semisync_replica.so", "--replica-net-timeout=10", "--loose-rpl-semi-sync-replica-enabled=ON"]
+  db-b:
+    command: ["--server-id=2", "--log-bin=mysql-bin", "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--plugin-load-add=semisync_source.so", "--plugin-load-add=semisync_replica.so", "--replica-net-timeout=10", "--loose-rpl-semi-sync-replica-enabled=ON"]
+  guard-a: &g
+    environment:
+      GUARD_MODE: ${GMODE:-act}
+      SEMISYNC_STALL: ${STALL:-true}
+  guard-b: *g
+  guard-witness: *g

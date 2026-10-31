@@ -68,3 +68,27 @@ func TestIsBoolFlag(t *testing.T) {
 		}
 	}
 }
+
+func TestSwitchoverToAndDryRunDefault(t *testing.T) {
+	base := []string{"--cluster=prod", "--node=db-a", "--peers=db-a,db-b"}
+	cfg, target, err := LoadSubcommand(append([]string{"--to", "db-b"}, base...))
+	if err != nil || target != "" || cfg.SwitchoverTo != "db-b" || !cfg.SwitchoverDryRun {
+		t.Fatalf("to=%q target=%q dry=%v err=%v", cfg.SwitchoverTo, target, cfg.SwitchoverDryRun, err)
+	}
+	cfg, _, err = LoadSubcommand(append(base, "--to=db-b", "--dry-run=false"))
+	if err != nil || cfg.SwitchoverTo != "db-b" || cfg.SwitchoverDryRun {
+		t.Fatalf("to=%q dry=%v err=%v", cfg.SwitchoverTo, cfg.SwitchoverDryRun, err)
+	}
+	// a bare -dry-run must not swallow the positional target
+	cfg, target, err = LoadSubcommand(append([]string{"--dry-run", "db-b"}, base...))
+	if err != nil || target != "db-b" || !cfg.SwitchoverDryRun {
+		t.Fatalf("target=%q dry=%v err=%v", target, cfg.SwitchoverDryRun, err)
+	}
+}
+
+func TestSemiStallFlagsDefaultOff(t *testing.T) {
+	cfg, _, err := LoadSubcommand([]string{"--cluster=prod", "--node=db-a", "--peers=db-a,db-b"})
+	if err != nil || cfg.SemiSyncStall || cfg.SemiSyncStallProbes != 3 {
+		t.Fatalf("stall=%v probes=%d err=%v", cfg.SemiSyncStall, cfg.SemiSyncStallProbes, err)
+	}
+}

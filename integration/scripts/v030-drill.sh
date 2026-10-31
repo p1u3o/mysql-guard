@@ -161,7 +161,7 @@ pass "V2: legacy key read in act mode, service=db-a:3306, migrate legacy->epoch-
 log "=== V3: switchover db-a -> db-b (legacy key, service, ProxySQL, ntfy) ==="
 ev_begin
 E=$(kv_epoch); A=$(alert_n switchover)
-docker compose exec -T guard-a mysql-guard switchover db-b --node=db-a --mysql-host=db-a "${FLAGS[@]}" || fail "switchover exit"
+docker compose exec -T guard-a mysql-guard switchover db-b --dry-run=false --node=db-a --mysql-host=db-a "${FLAGS[@]}" || fail "switchover exit"
 wait_for 20 "primary db-b" primary_is db-b
 check_roles() { [ "$(ro "$1")" = 00 ] || fail "$1 ro=$(ro "$1")"; [ "$(ro "$2")" = 11 ] || fail "$2 ro=$(ro "$2")"; }
 check_roles db-b db-a
@@ -179,7 +179,7 @@ log "=== V4: aborted switchover after the epoch bump (fault-injected SetMaster) 
 ev_begin
 E=$(kv_epoch); A=$(alert_n switchover-aborted)
 for g in guard-a guard-b; do docker compose exec -T $g touch /tmp/fault-setmaster; done
-docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=db-b "${FLAGS[@]}" && fail "faulted switchover reported success"
+docker compose exec -T guard-b mysql-guard switchover db-a --dry-run=false --node=db-b --mysql-host=db-b "${FLAGS[@]}" && fail "faulted switchover reported success"
 for g in guard-a guard-b; do docker compose exec -T $g rm -f /tmp/fault-setmaster; done
 two_writers && fail "TWO WRITERS after aborted switchover"
 check_roles db-b db-a
@@ -201,7 +201,7 @@ pass "V4: aborted switchover rolled back: db-b writer, db-a replica, epoch $E->$
 log "=== V5: switch back db-b -> db-a ==="
 ev_begin
 E=$(kv_epoch)
-docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "switchback exit"
+docker compose exec -T guard-b mysql-guard switchover db-a --dry-run=false --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "switchback exit"
 wait_for 20 "primary db-a" primary_is db-a
 check_roles db-a db-b
 master_is db-a:3306 || fail "key $(master)"
@@ -232,7 +232,7 @@ wait_for 30 "db-a replicating" replica_running db-a
 wait_for 30 "v6 on db-a" row_on db-a v6; wait_for 30 "GTIDs match" gtids_match
 [ "$(alert_n proxysql_writer_mismatch)" = "$M" ] || fail "ProxySQL mismatch alert during normal failover (grace too short?)"
 sleep 22
-docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "switch back to db-a"
+docker compose exec -T guard-b mysql-guard switchover db-a --dry-run=false --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "switch back to db-a"
 wait_for 20 "primary db-a" primary_is db-a
 wait_for 20 "writer service -> db-a:3306" svc_is db-a:3306
 writes_through_proxysql_land_on db-a v6b
@@ -279,7 +279,7 @@ for dir in "db-a db-b guard-a" "db-b db-a guard-b"; do
   ev_begin
   E=$(kv_epoch); A=$(alert_n switchover); AB=$(alert_n switchover-aborted); ER=$(alert_n errant_gtid)
   load_start "$TAG"; sleep 5
-  docker compose exec -T "$G" mysql-guard switchover "$TO" --node="$FROM" --mysql-host="$FROM" "${FLAGS[@]}" || { load_stop; fail "switchover $FROM->$TO under load"; }
+  docker compose exec -T "$G" mysql-guard switchover "$TO" --dry-run=false --node="$FROM" --mysql-host="$FROM" "${FLAGS[@]}" || { load_stop; fail "switchover $FROM->$TO under load"; }
   sleep 5; load_stop
   wait_for 20 "primary $TO" primary_is "$TO"
   check_roles "$TO" "$FROM"
@@ -310,7 +310,7 @@ primary_is db-a || fail "precondition primary db-a"
 E=$(kv_epoch); AB=$(alert_n switchover-aborted); S=$(alert_n switchover)
 sqlq db-b "STOP REPLICA SQL_THREAD"
 write_row db-a v10-lag
-docker compose exec -T guard-a mysql-guard switchover db-b --node=db-a --mysql-host=db-a "${FLAGS[@]}" --switchover-catchup-timeout=3s && fail "switchover with lagging target reported success"
+docker compose exec -T guard-a mysql-guard switchover db-b --dry-run=false --node=db-a --mysql-host=db-a "${FLAGS[@]}" --switchover-catchup-timeout=3s && fail "switchover with lagging target reported success"
 check_roles db-a db-b
 two_writers && fail "TWO WRITERS after catch-up abort"
 [ "$(kv_epoch)" = "$E" ] || fail "epoch bumped by catch-up abort ($E -> $(kv_epoch))"
@@ -385,7 +385,7 @@ docker compose exec -T guard-b mysql-guard rejoin db-b --node=db-a --mysql-host=
 wait_for 30 "V12 db-a replicating" replica_running db-a
 wait_for 30 "v12 on db-a" row_on db-a v12; wait_for 30 "V12 GTIDs match" gtids_match
 sleep 22
-docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "V12 switch back to db-a"
+docker compose exec -T guard-b mysql-guard switchover db-a --dry-run=false --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "V12 switch back to db-a"
 wait_for 20 "V12 primary db-a" primary_is db-a
 wait_for 20 "V12 writer service -> db-a:3306" svc_is db-a:3306
 writes_through_proxysql_land_on db-a v12b

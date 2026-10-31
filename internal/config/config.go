@@ -127,6 +127,17 @@ type Config struct {
 	SemiSyncGate    bool // refuse automatic failover when acknowledged writes could be lost (semi-sync enabled but last seen async)
 	SemiSyncRestore bool // re-enable semi-sync on the new primary/replica after failover, switchover and rejoin
 	ReplSourceSSL   bool // CHANGE REPLICATION SOURCE ... SOURCE_SSL=1
+
+	// semi-sync stall handling (off by default, see README "Semi-sync stall handling")
+	SemiSyncStall       bool    // leader turns semi-sync source off when the replica is confirmed dead, back on when it is caught up
+	SemiSyncStallProbes int     // consecutive leader ticks the replica must be confirmed dead before semi-sync is turned off
+	SemiSyncReenable    int     // consecutive leader ticks the replica must be healthy and caught up before semi-sync is turned on again
+	SemiSyncMaxLag      float64 // re-enable only when the replica lags at most this many seconds
+
+	// planned switchover
+	SwitchoverProxyWait time.Duration // how long to wait for ProxySQL's writer hostgroup to show the new primary (monitor mode: read-only check)
+	SwitchoverTo        string        // switchover --to <node>
+	SwitchoverDryRun    bool          // switchover prints its plan and preflight and changes nothing (default true)
 }
 
 // ProxySQLConfig is passed to the ProxySQL client.
@@ -417,6 +428,13 @@ func defineFlags(fs *flag.FlagSet, c *Config, raw *rawFlags) {
 	fs.BoolVar(&c.WitnessProbe, "witness-probe", envBool("WITNESS_PROBE", true), "witness: probe the primary with a MySQL connect check and vote (needs -mysql-user/-mysql-password-file and -mysql-peer-endpoints; without them the witness never votes)")
 	fs.BoolVar(&c.SemiSyncGate, "semisync-gate", envBool("SEMISYNC_GATE", true), "refuse automatic failover when semi-sync is enabled on the primary but was last seen async (acknowledged writes could be lost)")
 	fs.BoolVar(&c.SemiSyncRestore, "semisync-restore", envBool("SEMISYNC_RESTORE", true), "after failover/switchover/rejoin, re-enable semi-sync source/replica settings when they were enabled before")
+	fs.BoolVar(&c.SemiSyncStall, "semisync-stall", envBool("SEMISYNC_STALL", false), "leader only, act mode: when the replica is confirmed dead (own probe + witness connect check + no semi-sync client, for -semisync-stall-probes ticks) set rpl_semi_sync_source_enabled=OFF on the primary so commits stop stalling for the semi-sync timeout; turn it on again when the replica is caught up. Run it on the witness too (it then probes the replica). Default off")
+	fs.IntVar(&c.SemiSyncStallProbes, "semisync-stall-probes", envInt("SEMISYNC_STALL_PROBES", 3), "consecutive leader ticks the replica must be confirmed dead before semi-sync is turned off")
+	fs.IntVar(&c.SemiSyncReenable, "semisync-reenable-ticks", envInt("SEMISYNC_REENABLE_TICKS", 5), "consecutive leader ticks the replica must be healthy (IO+SQL running, GTID caught up, lag within -semisync-reenable-max-lag) before semi-sync is turned on again")
+	fs.Float64Var(&c.SemiSyncMaxLag, "semisync-reenable-max-lag", envFloat("SEMISYNC_REENABLE_MAX_LAG", 1), "semi-sync is turned on again only when the replica lags at most this many seconds")
+	fs.StringVar(&c.SwitchoverTo, "to", "", "switchover: the node to promote (same as the positional argument)")
+	fs.BoolVar(&c.SwitchoverDryRun, "dry-run", true, "switchover: print the preflight and the plan and change nothing; pass -dry-run=false to execute")
+	fs.DurationVar(&c.SwitchoverProxyWait, "switchover-proxysql-wait", envDuration("SWITCHOVER_PROXYSQL_WAIT", 30*time.Second), "after a switchover, wait this long for ProxySQL's writer hostgroup to show the new primary (needs -proxysql-verify; read-only check, never fails the switchover)")
 	fs.BoolVar(&c.ReplSourceSSL, "repl-source-ssl", envBool("REPL_SOURCE_SSL", true), "CHANGE REPLICATION SOURCE uses SOURCE_SSL=1")
 	fs.StringVar(&c.NtfyTokenFile, "ntfy-token-file", envOr("NTFY_TOKEN_FILE", ""), "optional ntfy access token file (Authorization: Bearer)")
 

@@ -43,7 +43,7 @@ func (r *Runtime) sampleSemiSync(ctx context.Context, now time.Time, primary str
 	rec, _ := r.store.GetSemiSync(ctx)
 	nr := consul.SemiSyncRecord{Enabled: po.st.SemiSync.SourceEnabled, Mode: po.st.SemiSync.Mode(), Node: primary, Epoch: epoch, At: now.UTC()}
 	if rec != nil && rec.Pending && !po.st.SemiSync.SourceEnabled {
-		nr.Enabled, nr.Pending = true, true // restore still owed at rejoin
+		nr.Enabled, nr.Pending, nr.StallDisabled = true, true, rec.StallDisabled // restore still owed at rejoin or stall re-enable
 	}
 	if err := r.store.PutSemiSync(ctx, nr); err != nil {
 		r.log.Warn("semisync kv write", "err", err)
@@ -126,7 +126,25 @@ func (r *Runtime) witnessProbe(ctx context.Context, primary string) {
 			}
 		}
 	}
+	peerRes := map[string]string{}
+	if r.cfg.SemiSyncStall && r.cfg.WitnessProbe && r.peers != nil && primary != "" {
+		// semi-sync stall handling: confirm a dead replica for the primary's guard
+		for _, p := range r.cfg.Peers {
+			if p == primary {
+				continue
+			}
+			if _, err := r.peers.DB(p); err != nil {
+				continue
+			}
+			if alive, _ := r.peers.Ping(ctx, p, r.cfg.ProbeTimeout); alive {
+				peerRes[p] = "ok"
+			} else {
+				peerRes[p] = "dead"
+			}
+		}
+	}
 	r.mu.Lock()
+	r.peerProbes = peerRes
 	prev := r.primaryProbe
 	r.primaryProbe = res
 	r.mu.Unlock()

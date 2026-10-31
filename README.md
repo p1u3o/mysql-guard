@@ -18,7 +18,7 @@ Latest release: **v0.3.4**. Releases are listed under [Releases](#releases).
 | Monitoring | Every `-interval` (default 2s), each `db` guard probes MySQL and reads replication state (IO/SQL threads, lag, `read_only`, GTID sets). It publishes a heartbeat to Consul and serves `/status`, `/metrics` and a read-only web UI. |
 | Failover | Applies only in `act` mode, on the leader. Failover starts when at least `-votes-needed` guards report the primary dead for 3 consecutive ticks. It also starts when a reachable primary stays read-only for longer than `-read-only-grace` and lacks data. The leader then promotes the most advanced replica that passes all gates: not stalled, no errant GTIDs, executed+retrieved is a superset of the last published writer GTIDs, and retrieved GTIDs applied (`-lag-gate-max-wait`, 0 = never promote with missing GTIDs). Failovers are rate-limited by `-min-between-failovers` (default 1h). |
 | Restore writer | A primary that is read-only but has complete data is made writable again at epoch+1, with no failover. This is not rate-limited. |
-| Switchover | Run as `mysql-guard switchover <target>`. Steps: fence the old primary (`super_read_only`, ProxySQL offline, drain open transactions for `-fence-drain-timeout`, then kill them), wait for the target to catch up (`-switchover-catchup-timeout`), run an errant-GTID check both ways, then bump the epoch and write the key. Any failure before the epoch bump rolls back. A key-write failure after the bump also rolls back, and the alert is `switchover-aborted`. |
+| Switchover | Run as `mysql-guard switchover --to <target>` (dry run by default; add `--dry-run=false` to execute; a preflight must pass first). Steps: fence the old primary (`super_read_only`, ProxySQL offline, drain open transactions for `-fence-drain-timeout`, then kill them), wait for the target to catch up (`-switchover-catchup-timeout`), run an errant-GTID check both ways, then bump the epoch and write the key. Any failure before the epoch bump rolls back. A key-write failure after the bump also rolls back, and the alert is `switchover-aborted`. |
 | Rejoin | Run as `mysql-guard rejoin <source>`. It runs an errant-GTID check, then either re-points this node with auto-position or marks it `needs-rebuild` (`mysql/<cluster>/guard/needs-rebuild/<node>`). |
 | Fencing | Applies in `fence` and `act` modes. Any non-primary that stays writable for 2 ticks is set to `super_read_only=ON`. |
 | Writer key | Writes `mysql/master/<cluster>` (format chosen by `-master-format`). On an empty cluster, the leader seeds the key when every peer is reachable, exactly one peer is writable, and no other peer has GTIDs the writer lacks. |
@@ -82,6 +82,10 @@ Each guard reads the semi-sync variables and status (`rpl_semi_sync_source_*`, o
 - **Gate:** if semi-sync was enabled on the primary and it was last seen async, automatic failover is refused (logged `semisync_gate`, one alert per primary and epoch): acknowledged writes may exist only on the lost primary. Disable with `-semisync-gate=false`.
 - **Restore:** the promoted node gets semi-sync source OFF (no replica to acknowledge yet) and the record is marked pending. When a replica (re)joins, it gets replica ON before `START REPLICA`, and the source gets source ON once the replica is connected. The same happens at switchover whenever the cluster runs semi-sync (the record says enabled or pending, or either node has source enabled).
 - **Restart without failover:** the guard does not re-enable semi-sync on a primary whose mysqld restarted in place; set `rpl_semi_sync_source_enabled`/`rpl_semi_sync_replica_enabled` in my.cnf (or `SET PERSIST`) so a restarted node comes back with its semi-sync settings. Until then `semisync_async` stays raised.
+
+### Semi-sync stall handling (opt-in)
+
+With `-semisync-stall` (default off, act mode, leader only) the guard turns `rpl_semi_sync_source_enabled` OFF on the primary when the replica is confirmed dead, so writes stop waiting for the semi-sync timeout, and ON again once the replica is back and caught up. Dead means the leader's own probe, the witness's connect check (run the flag on the witness too) and an empty semi-sync client list all agree for `-semisync-stall-probes` ticks (3). It never acts in maintenance, during a failover/fence/switchover, or while the failover gate holds, and it only undoes its own disable (`stall_disabled` in the semi-sync record). Re-enable needs `-semisync-reenable-ticks` (5) healthy ticks with lag <= `-semisync-reenable-max-lag` (1s) and is verified by a registered semi-sync client, else reverted. Metrics: `mysql_guard_semisync_stall_off`, `_disabled_total`, `_reenabled_total`, `_skipped_total{reason}`. Details and drill plan in `docs/`.
 
 ### Member service and health checks
 
@@ -191,6 +195,12 @@ Every option is a flag. Where an env var column has a value, the env var sets th
 | `-repl-source-ssl` | `REPL_SOURCE_SSL` | `true` | `CHANGE REPLICATION SOURCE ... SOURCE_SSL=1` |
 | `-stall-after` | `STALL_AFTER` | `30s` | A replica whose threads are ON but whose GTID gap does not shrink for this long is `stalled`. It raises an alert and is never a candidate. A replica that keeps applying transactions (a delayed or steadily lagging replica) is lag, not a stall. |
 | `-fence-drain-timeout` | `FENCE_DRAIN_TIMEOUT` | `3s` | Switchover: wait for open transactions on the fenced source, then kill them |
+| `-semisync-stall` | `SEMISYNC_STALL` | `false` | Turn semi-sync source off when the replica is confirmed dead, on again when caught up (see Semi-sync stall handling) |
+| `-semisync-stall-probes` | `SEMISYNC_STALL_PROBES` | `3` | Consecutive leader ticks the replica must be confirmed dead |
+| `-semisync-reenable-ticks` | `SEMISYNC_REENABLE_TICKS` | `5` | Consecutive healthy ticks before semi-sync is turned on again |
+| `-semisync-reenable-max-lag` | `SEMISYNC_REENABLE_MAX_LAG` | `1` | Max replica lag in seconds at re-enable |
+| `-switchover-proxysql-wait` | `SWITCHOVER_PROXYSQL_WAIT` | `30s` | Switchover: wait for ProxySQL's writer hostgroup to show the new primary (read-only check, needs `-proxysql-verify`) |
+| `-to` / `-dry-run` | - | `""` / `true` | Switchover: target node; dry run prints the preflight and plan, `-dry-run=false` executes |
 | `-switchover-catchup-timeout` | `SWITCHOVER_CATCHUP_TIMEOUT` | `0` (= 2x `-max-apply-lag`) | Switchover: maximum wait for the target to catch up |
 
 ### ProxySQL
@@ -385,9 +395,14 @@ consul kv delete mysql/<cluster>/guard/maintenance
 **Planned switchover:**
 
 ```bash
-mysql-guard switchover <target-node> -cluster=<cluster> -peers=<db-a>,<db-b> -node=<this-node> -mode=act ...
-# "handover" is an alias. With no target, the last peer in -peers is used.
+# dry run (the default): preflight checks and the plan, nothing is changed
+mysql-guard switchover --to <target-node> -cluster=<cluster> -peers=<db-a>,<db-b> -node=<this-node> -mode=act ...
+# execute
+mysql-guard switchover --to <target-node> --dry-run=false -cluster=<cluster> -peers=<db-a>,<db-b> -node=<this-node> -mode=act ...
+# "handover" is an alias. The target may also be given as a positional argument.
 ```
+
+The target must be named (no implicit default). The preflight must pass before anything is touched: no maintenance or transition in flight, old primary is the current writer, target healthy with IO/SQL running, lag 0, caught up on GTID, semi-sync acknowledged by the target (when the source has it on). With `-proxysql-verify` the run ends with a read-only check that ProxySQL's writer hostgroup shows the new primary (`-switchover-proxysql-wait`, 30s; a miss alerts and never rolls back). See `docs/DESIGN-semisync-stall-and-switchover.md`.
 
 **Rejoin** an old primary as a replica (run on that node):
 

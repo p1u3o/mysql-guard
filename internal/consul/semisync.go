@@ -12,12 +12,16 @@ import (
 // SemiSyncRecord is the cluster's last-known semi-sync state of the writer
 // (v0.3.6). Enabled survives a failover so rejoin can re-enable semi-sync.
 type SemiSyncRecord struct {
-	Enabled bool      `json:"enabled"`           // semi-sync was configured on the writer
-	Pending bool      `json:"pending,omitempty"` // failover left semi-sync off; rejoin re-enables it
-	Mode    string    `json:"mode"`              // sync, async, off, unknown (last sample)
-	Node    string    `json:"node"`
-	Epoch   uint64    `json:"epoch"`
-	At      time.Time `json:"at"`
+	Enabled bool `json:"enabled"`           // semi-sync was configured on the writer
+	Pending bool `json:"pending,omitempty"` // failover left semi-sync off; rejoin re-enables it
+	// StallDisabled: the guard itself turned source semi-sync off because the
+	// replica was confirmed dead (-semisync-stall). Only then does the guard
+	// turn it on again; a failover or an operator clears the flag.
+	StallDisabled bool      `json:"stall_disabled,omitempty"`
+	Mode          string    `json:"mode"` // sync, async, off, unknown (last sample)
+	Node          string    `json:"node"`
+	Epoch         uint64    `json:"epoch"`
+	At            time.Time `json:"at"`
 }
 
 func (k KeyPaths) SemiSync() string { return fmt.Sprintf("mysql/%s/guard/semisync", k.Cluster) }

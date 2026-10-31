@@ -31,6 +31,10 @@ type GuardInstance struct {
 	// (connecting, erroring, or no event/heartbeat for -replica-stale).
 	ReplicaIOLost   bool   `json:"replica_io_lost,omitempty"`
 	ReplicaIOReason string `json:"replica_io_reason,omitempty"`
+	// PeerProbes (witness, -semisync-stall): connect check of each db peer
+	// that is not the primary, "ok" or "dead". A confirmation for the primary
+	// guard's own probe of the replica; never part of the failover quorum.
+	PeerProbes map[string]string `json:"peer_probes,omitempty"`
 	// SemiSync is this db guard's local semi-sync mode (sync/async/off/unknown).
 	SemiSync string `json:"semisync,omitempty"`
 }

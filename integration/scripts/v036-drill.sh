@@ -76,7 +76,7 @@ net_cut() { for c in "db-$1" "guard-$1"; do docker network disconnect "$NET" "${
 net_heal() { for c in "db-$1" "guard-$1"; do docker network connect --alias "$c" "$NET" "${PROJ}-$c-1"; done; }
 primary_status_is() { [ "$(anystatus | jq -r .primary)" = "$1" ]; }
 rejoin() { docker compose exec -T "guard-$2" mysql-guard rejoin "db-$2" --node="db-$1" --mysql-host="db-$1" "${FLAGS[@]}" || fail "rejoin db-$1 to db-$2"; wait_for 60 "db-$1 replicating" replica_running "db-$1"; wait_for 60 "GTIDs match" gtids_match; }
-switch_to() { docker compose exec -T "guard-$2" mysql-guard switchover "db-$1" --node="db-$2" --mysql-host="db-$2" "${FLAGS[@]}" || fail "switchover to db-$1"; wait_for 30 "primary db-$1" primary_key_is "db-$1"; }
+switch_to() { docker compose exec -T "guard-$2" mysql-guard switchover "db-$1" --dry-run=false --node="db-$2" --mysql-host="db-$2" "${FLAGS[@]}" || fail "switchover to db-$1"; wait_for 30 "primary db-$1" primary_key_is "db-$1"; }
 # writes every second through ProxySQL; acknowledged ids are logged (id per line)
 load_start() { docker compose exec -T -d loader bash -c "echo \$\$ > /tmp/load.pid; : > /tmp/acked-$1; while :; do id=\$(mysql -h proxysql -P6033 -uroot -pplaceholder -N -B -e \"INSERT INTO drill.load (tag) VALUES ('$1'); SELECT LAST_INSERT_ID()\" 2>/dev/null) && echo \$id >> /tmp/acked-$1; sleep 1; done"; sleep 2; }
 load_stop() { docker compose exec -T loader bash -c 'kill $(cat /tmp/load.pid) 2>/dev/null; rm -f /tmp/load.pid' || true; }

@@ -109,7 +109,7 @@ check_roles db-a db-b
 write_row db-a pre-switch
 wait_for 30 "pre-switch row on db-b" row_on db-b pre-switch
 N=$(count_ok switchover); E=$(kv_epoch)
-docker compose exec -T guard-a mysql-guard switchover db-b --node=db-a --mysql-host=db-a "${FLAGS[@]}" || fail "switchover command exit"
+docker compose exec -T guard-a mysql-guard switchover db-b --dry-run=false --node=db-a --mysql-host=db-a "${FLAGS[@]}" || fail "switchover command exit"
 wait_for 20 "primary db-b on all guards" primary_is db-b
 check_roles db-b db-a
 [ "$(kv_epoch)" = $((E+1)) ] || fail "epoch $(kv_epoch) want $((E+1))"
@@ -124,7 +124,7 @@ pass "drill 2: switchover db-a->db-b epoch $E->$(kv_epoch), gtid=$(gtid db-a)"
 
 log "=== Drill 3: switch back db-b -> db-a (act) ==="
 N=$(count_ok switchover); E=$(kv_epoch)
-docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "switchback command exit"
+docker compose exec -T guard-b mysql-guard switchover db-a --dry-run=false --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "switchback command exit"
 wait_for 20 "primary db-a on all guards" primary_is db-a
 check_roles db-a db-b
 [ "$(kv_epoch)" = $((E+1)) ] || fail "epoch $(kv_epoch) want $((E+1))"
@@ -209,7 +209,7 @@ count_res() { actions | jq --arg a "$1" --arg r "$2" '[.[] | select(.action==$a 
 
 log "=== Drill 8: switchover verifies the new replica is connected via the repl account ==="
 N=$(count_ok switchover); E=$(kv_epoch)
-docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "drill 8 switchover exit"
+docker compose exec -T guard-b mysql-guard switchover db-a --dry-run=false --node=db-b --mysql-host=db-b "${FLAGS[@]}" || fail "drill 8 switchover exit"
 wait_for 20 "primary db-a on all guards" primary_is db-a
 check_roles db-a db-b
 replica_running db-b || fail "db-b threads not ON at switchover return"
@@ -223,7 +223,7 @@ log "Drill 8b: broken repl password -> switchover logged degraded, never ok"
 sqlq db-a "ALTER USER 'repl'@'%' IDENTIFIED BY 'wrong-on-purpose'" || fail "break repl pw"
 wait_for 30 "GTIDs match" gtids_match
 N=$(count_ok switchover); D=$(count_res switchover degraded)
-if docker compose exec -T guard-a mysql-guard switchover db-b --node=db-a --mysql-host=db-a "${FLAGS[@]}"; then fail "degraded switchover exited 0"; fi
+if docker compose exec -T guard-a mysql-guard switchover db-b --dry-run=false --node=db-a --mysql-host=db-a "${FLAGS[@]}"; then fail "degraded switchover exited 0"; fi
 wait_for 20 "primary db-b on all guards after degraded switchover" primary_is db-b
 check_roles db-b db-a
 [ "$(count_ok switchover)" = "$N" ] || fail "false ok logged for degraded switchover"
@@ -249,7 +249,7 @@ nr_keys() { docker compose exec -T consul consul kv get -recurse mysql/example/g
 primary_is db-b || fail "drill 9 expects primary db-b"
 run_proxy delay
 N=$(count_ok switchover); E=$(kv_epoch); T0=$(date +%s)
-docker compose exec -T guard-b mysql-guard switchover db-a --node=db-b --mysql-host=127.0.0.1 --mysql-port=3399 "${PFLAGS[@]}" || { docker compose exec -T guard-b cat /tmp/slowproxy-delay.log; fail "drill 9a switchover exit"; }
+docker compose exec -T guard-b mysql-guard switchover db-a --dry-run=false --node=db-b --mysql-host=127.0.0.1 --mysql-port=3399 "${PFLAGS[@]}" || { docker compose exec -T guard-b cat /tmp/slowproxy-delay.log; fail "drill 9a switchover exit"; }
 DT=$(( $(date +%s) - T0 ))
 docker compose exec -T guard-b cat /tmp/slowproxy-delay.log | grep -q 'DELAYING "START REPLICA" by 6s' || fail "proxy did not delay START REPLICA"
 stop_proxy
@@ -267,7 +267,7 @@ pass "drill 9a: START REPLICA delayed 6s -> switchover ok in ${DT}s, epoch $E->$
 log "Drill 9b: connection dropped right after START REPLICA"
 docker compose exec -T -d guard-a sh -c "exec slowproxy -listen 127.0.0.1:3399 -target db-a:3306 -mode drop > /tmp/slowproxy-drop.log 2>&1"; sleep 1
 N=$(count_ok switchover); E=$(kv_epoch)
-docker compose exec -T guard-a mysql-guard switchover db-b --node=db-a --mysql-host=127.0.0.1 --mysql-port=3399 "${PFLAGS[@]}" || { docker compose exec -T guard-a cat /tmp/slowproxy-drop.log; fail "drill 9b switchover exit"; }
+docker compose exec -T guard-a mysql-guard switchover db-b --dry-run=false --node=db-a --mysql-host=127.0.0.1 --mysql-port=3399 "${PFLAGS[@]}" || { docker compose exec -T guard-a cat /tmp/slowproxy-drop.log; fail "drill 9b switchover exit"; }
 docker compose exec -T guard-a cat /tmp/slowproxy-drop.log | grep -q 'DROPPING client after "START REPLICA"' || fail "proxy did not drop after START REPLICA"
 docker compose exec -T guard-a sh -c 'kill $(pidof slowproxy) 2>/dev/null; true'
 wait_for 20 "primary db-b on all guards" primary_is db-b

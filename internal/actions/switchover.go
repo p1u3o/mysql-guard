@@ -181,6 +181,7 @@ func (e *Executor) Switchover(ctx context.Context, newPrimaryArg string, local, 
 	if semiAfter {
 		e.semiRejoinAfter(ctx, newAdm, newPrimary, "switchover", newEpoch)
 	}
+	e.verifyProxyWriter(ctx, newEpoch, newPrimary)
 	e.actionLog(ctx, newEpoch, "switchover", fmt.Sprintf("%s -> %s complete at epoch %d, replica %s connected (user %s)", oldPrimary, newPrimary, newEpoch, oldPrimary, replUser), "ok", "end")
 	e.Alert(ctx, "switchover", fmt.Sprintf("%s -> %s complete at epoch %d", oldPrimary, newPrimary, newEpoch), false)
 	return nil

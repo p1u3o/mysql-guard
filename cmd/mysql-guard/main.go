@@ -158,14 +158,18 @@ func runCLI(args []string) int {
 	}
 	switch sub {
 	case "switchover", "handover":
+		if cfg.SwitchoverTo != "" {
+			if target != "" && target != cfg.SwitchoverTo {
+				log.Error("switchover: --to and the positional target differ", "to", cfg.SwitchoverTo, "positional", target)
+				return 2
+			}
+			target = cfg.SwitchoverTo
+		}
 		if target == "" {
-			target = cfg.Peers[len(cfg.Peers)-1]
+			log.Error("switchover: name the node to promote with --to <node>")
+			return 2
 		}
-		oldPrimary, newPrimary := mysql.ResolveOldNewPrimary(cfg, target)
-		if cur, _, err := store.GetPrimary(ctx); err == nil && cur != "" && cur != newPrimary {
-			oldPrimary = cur
-		}
-		return exitErr(exec.Switchover(ctx, newPrimary, readExecuted(oldPrimary), readExecuted(newPrimary)))
+		return exitErr(exec.SwitchoverRun(ctx, os.Stdout, target, cfg.SwitchoverDryRun))
 	case "rejoin":
 		if target == "" {
 			target = cfg.Peers[0]

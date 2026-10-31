@@ -159,6 +159,15 @@ func (a *Admin) SetSemiSync(ctx context.Context, source, replica bool) error {
 	return a.setEither(ctx, "rpl_semi_sync_replica_enabled", "rpl_semi_sync_slave_enabled", v(replica))
 }
 
+// SetSemiSyncSource sets only the source switch (replica side untouched).
+func (a *Admin) SetSemiSyncSource(ctx context.Context, on bool) error {
+	v := "OFF"
+	if on {
+		v = "ON"
+	}
+	return a.setEither(ctx, "rpl_semi_sync_source_enabled", "rpl_semi_sync_master_enabled", v)
+}
+
 // setEither sets the 8.0.26+ variable name, falling back to the legacy one.
 func (a *Admin) setEither(ctx context.Context, name, legacy, val string) error {
 	err := a.exec(ctx, "SET GLOBAL "+name+"="+val)

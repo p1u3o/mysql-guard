@@ -19,6 +19,7 @@ import (
 	"mysql-guard/internal/mysql"
 	"mysql-guard/internal/proxysql"
 	"mysql-guard/internal/replhealth"
+	"mysql-guard/internal/semistall"
 	"mysql-guard/internal/vote"
 
 	capi "github.com/hashicorp/consul/api"
@@ -72,6 +73,11 @@ type Runtime struct {
 	quorum       Quorum
 	members      *memberDebounce
 	memberErr    string
+
+	// semi-sync stall handling (-semisync-stall)
+	semiStall     semistall.Tracker
+	semiStallLast string
+	peerProbes    map[string]string // witness connect check of the non-primary peers
 }
 
 // Version is the build version shown in /status (set from main via ldflags).
@@ -303,6 +309,7 @@ func (r *Runtime) healthTick(ctx context.Context, now time.Time) {
 		if primary != "" && r.cfg.Mode == config.ModeAct && !maint && r.lock.VerifyLeaderBeforeAction(r.cfg.SessionTTL) {
 			r.syncMembers(ctx, now, primary, epochKV, obs)
 		}
+		r.semiStallTick(ctx, now, maint, primary, epochKV, obs)
 	}
 	r.metrics.DeadVotes.WithLabelValues("total").Set(float64(dead))
 	r.lastHealth = now
@@ -591,6 +598,7 @@ func (r *Runtime) refreshStatus(ctx context.Context, now time.Time, dead int, ma
 	}
 	r.mu.RLock()
 	inst.PrimaryProbe, inst.ReplicaIOLost, inst.ReplicaIOReason, inst.SemiSync = r.primaryProbe, r.ioLost, r.ioReason, r.selfSemi
+	inst.PeerProbes = r.peerProbes
 	quorum := r.quorum
 	r.mu.RUnlock()
 	_ = r.store.PutGuardInstance(ctx, inst)

@@ -55,7 +55,7 @@ func (r *Runtime) semiStallBlocked(ctx context.Context, now time.Time, maint boo
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	switch {
-	case r.deadTicks > 0:
+	case r.dead.ticks > 0:
 		return "primary failover vote in progress"
 	case !r.roSince.IsZero():
 		return "primary read-only"

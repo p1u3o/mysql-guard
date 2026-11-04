@@ -384,7 +384,7 @@ func defineFlags(fs *flag.FlagSet, c *Config, raw *rawFlags) {
 	fs.DurationVar(&c.Interval, "interval", c.Interval, "health loop interval")
 	fs.DurationVar(&c.ProbeTimeout, "probe-timeout", c.ProbeTimeout, "per-probe deadline")
 	fs.IntVar(&c.SlowThreshold, "slow-threshold", c.SlowThreshold, "consecutive slow probes before failed")
-	fs.DurationVar(&c.DeadAfter, "dead-after", c.DeadAfter, "time since first failure before vote counts dead")
+	fs.DurationVar(&c.DeadAfter, "dead-after", c.DeadAfter, "the failover quorum must hold continuously this long before a failover (any healthy observation resets it); keep above the semi-sync source timeout")
 	fs.IntVar(&c.VotesNeeded, "votes-needed", c.VotesNeeded, "dead votes required (voters: each db guard, the witness connect check, and the replica IO vote; see README Quorum)")
 	fs.DurationVar(&c.SessionTTL, "session-ttl", c.SessionTTL, "Consul session TTL")
 	fs.DurationVar(&c.LockDelay, "lock-delay", c.LockDelay, "Consul lock delay")

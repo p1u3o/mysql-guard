@@ -11,8 +11,9 @@ import (
 
 // Quorum (v0.3.6): who may declare the primary dead.
 //
-// A failover needs Votes >= -votes-needed (default 2) on deadTicks (3)
-// consecutive leader ticks, and then still passes the candidate gates
+// A failover needs Votes >= -votes-needed (default 2) continuously for at
+// least -dead-after and on 3 consecutive leader ticks (see deadWindow; any tick
+// below the quorum resets the clock), and then still passes the candidate gates
 // (stall, GTID superset, semi-sync, rate limit, epoch CAS).
 //
 // Voters, at most one vote each, and only from fresh heartbeats (younger than

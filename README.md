@@ -16,7 +16,7 @@ Latest release: **v0.3.4**. Releases are listed under [Releases](#releases).
 | Area | Behaviour |
 |---|---|
 | Monitoring | Every `-interval` (default 2s), each `db` guard probes MySQL and reads replication state (IO/SQL threads, lag, `read_only`, GTID sets). It publishes a heartbeat to Consul and serves `/status`, `/metrics` and a read-only web UI. |
-| Failover | Applies only in `act` mode, on the leader. Failover starts when at least `-votes-needed` guards report the primary dead for 3 consecutive ticks. It also starts when a reachable primary stays read-only for longer than `-read-only-grace` and lacks data. The leader then promotes the most advanced replica that passes all gates: not stalled, no errant GTIDs, executed+retrieved is a superset of the last published writer GTIDs, and retrieved GTIDs applied (`-lag-gate-max-wait`, 0 = never promote with missing GTIDs). Failovers are rate-limited by `-min-between-failovers` (default 1h). |
+| Failover | Applies only in `act` mode, on the leader. Failover starts when at least `-votes-needed` guards report the primary dead continuously for `-dead-after` (and at least 3 consecutive ticks). It also starts when a reachable primary stays read-only for longer than `-read-only-grace` and lacks data. The leader then promotes the most advanced replica that passes all gates: not stalled, no errant GTIDs, executed+retrieved is a superset of the last published writer GTIDs, and retrieved GTIDs applied (`-lag-gate-max-wait`, 0 = never promote with missing GTIDs). Failovers are rate-limited by `-min-between-failovers` (default 1h). |
 | Restore writer | A primary that is read-only but has complete data is made writable again at epoch+1, with no failover. This is not rate-limited. |
 | Switchover | Run as `mysql-guard switchover --to <target>` (dry run by default; add `--dry-run=false` to execute; a preflight must pass first). Steps: fence the old primary (`super_read_only`, ProxySQL offline, drain open transactions for `-fence-drain-timeout`, then kill them), wait for the target to catch up (`-switchover-catchup-timeout`), run an errant-GTID check both ways, then bump the epoch and write the key. Any failure before the epoch bump rolls back. A key-write failure after the bump also rolls back, and the alert is `switchover-aborted`. |
 | Rejoin | Run as `mysql-guard rejoin <source>`. It runs an errant-GTID check, then either re-points this node with auto-position or marks it `needs-rebuild` (`mysql/<cluster>/guard/needs-rebuild/<node>`). |
@@ -61,7 +61,7 @@ Each guard runs three independent loops: lock renewal (Consul session), health (
 
 ### Failover quorum
 
-A failover tick counts only with at least `-votes-needed` (default 2) votes; `-dead-after` must also pass and the primary must look dead on 3 consecutive ticks. Every voter needs a fresh heartbeat (at most 3 x `-interval` + 2 x `-probe-timeout` + 1s old, so a guard slowed by a dead primary still votes) and must see the same primary. One vote each:
+A failover tick counts only with at least `-votes-needed` (default 2) votes. The quorum must hold **continuously for at least `-dead-after`** and on at least 3 consecutive ticks; any tick with fewer than `-votes-needed` votes (a healthy observation) resets the clock. A new leader, or a leader that skipped ticks for longer than a vote's maximum age (maintenance mode, read-only grace), starts the clock again. Every voter needs a fresh heartbeat (at most 3 x `-interval` + 2 x `-probe-timeout` + 1s old, so a guard slowed by a dead primary still votes) and must see the same primary. One vote each:
 
 | Voter | Vote "dead" when |
 |---|---|
@@ -72,6 +72,14 @@ A failover tick counts only with at least `-votes-needed` (default 2) votes; `-d
 The IO vote only counts when the whole primary host looks gone (its guard is silent too), so a replica that is merely cut off from the primary cannot fail it over: the fresh primary guard, or the witness, vetoes it. The IO vote may come from the same replica as a probe vote; that is what lets a two-node pair survive whole-host loss when the witness cannot probe MySQL. The voters behind each decision are in `/status` (`voters`) and in the failover alert (`votes: ...`).
 
 Then the existing gates still apply (lag/GTID gate, errant GTIDs, stall, `-min-between-failovers`, maintenance), plus the semi-sync gate.
+
+#### Failover timing and `-dead-after`
+
+In v0.3.8-rc1 and earlier `-dead-after` only fed the `DeadVotes{v1}` metric, so a quorum of two probe timeouts failed the primary over after 3 ticks (about `3 x -interval` plus the probe timeout, roughly 9s with the defaults). Now the earliest failover is the first leader tick at or after `-dead-after` of continuous quorum (and never fewer than 3 ticks): with `-dead-after=45s` and `-interval=2s`, about 45-47s after the quorum first formed. A blip shorter than `-dead-after` (a network stall, a slow host, a brief overlay path change) never fails the primary over, however many ticks it spans.
+
+Interaction with semi-sync: the primary waits `rpl_semi_sync_source_timeout` (10s in production) for a replica ack and then falls back to async. Choose `-dead-after` well above that timeout. If the primary is alive but unreachable for the guards, it keeps accepting writes (async after 10s) during the `-dead-after` window; writes that exist only on the old primary are not lost until a failover actually happens, and the failover GTID superset gate and the later rejoin errant check still protect against promoting or rejoining over data that is not on the candidate. The cost of a larger `-dead-after` is that a truly dead primary is not replaced until it elapses, plus the failover itself; writes fail for that long. While the quorum is forming (`/status` decision shows "dead for Ns, waiting for -dead-after"), the semi-sync stall handler stays out of the way.
+
+Rollout note: the clock lives in the leader's memory only, so a leader change during an outage restarts it (conservative: a failover is delayed, never hastened). Rolling guards one at a time is safe.
 
 ### Semi-sync
 
@@ -181,7 +189,7 @@ Every option is a flag. Where an env var column has a value, the env var sets th
 | `-interval` | | `2s` | Health loop interval |
 | `-probe-timeout` | | `3s` | Deadline for each probe |
 | `-slow-threshold` | | `4` | Consecutive slow probes before a probe counts as failed |
-| `-dead-after` | | `30s` | Time since the first failure before a vote counts as dead |
+| `-dead-after` | | `30s` | How long the failover quorum (`-votes-needed` dead votes) must hold continuously before a failover. Resets on any healthy observation. Keep it above the primary's `rpl_semi_sync_source_timeout`; 45s is recommended for production. A reachable read-only primary that is missing data is failed after `-read-only-grace` instead |
 | `-votes-needed` | | `2` | Dead votes required before a failover tick counts |
 | `-min-between-failovers` | | `1h` | Minimum time between real failovers |
 | `-max-apply-lag` | | `30s` | Time allowed to apply retrieved GTIDs |

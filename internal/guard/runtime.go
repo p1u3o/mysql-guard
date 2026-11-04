@@ -46,7 +46,7 @@ type Runtime struct {
 	lastHealth time.Time
 	lastWatch  time.Time
 	writable   map[string]int
-	deadTicks  int
+	dead       deadWindow  // failover quorum run: consecutive ticks and -dead-after
 	pHold      primaryHold // v0.3.7 replica-alert hold while the primary recovers
 	roSince    time.Time   // primary first seen reachable but read-only (zero = not read-only)
 	health     HealthReporter
@@ -471,18 +471,21 @@ func (r *Runtime) decide(ctx context.Context, now time.Time, maint bool, primary
 
 	r.mu.Lock()
 	if roFailed {
-		r.deadTicks = 3
-	} else if dead >= r.cfg.VotesNeeded {
-		r.deadTicks++
+		r.dead.force(now)
 	} else {
-		r.deadTicks = 0
+		r.dead.observe(now, dead >= r.cfg.VotesNeeded, VoteMaxAge(r.cfg.Interval, r.cfg.ProbeTimeout))
 	}
-	deadTicks := r.deadTicks
+	ready := r.dead.ready(now, r.cfg.DeadAfter)
+	deadFor := r.dead.elapsed(now)
 	lastFail := r.lastFail
 	r.mu.Unlock()
-	if deadTicks < 3 {
+	if !ready {
 		if len(toFence) == 0 {
-			r.setDecision("none: primary " + primary + " healthy")
+			if deadFor > 0 {
+				r.setDecision("none: primary " + primary + " dead for " + deadFor.Round(time.Second).String() + ", waiting for -dead-after " + r.cfg.DeadAfter.String())
+			} else {
+				r.setDecision("none: primary " + primary + " healthy")
+			}
 		}
 		return dead
 	}
@@ -532,7 +535,7 @@ func (r *Runtime) decide(ctx context.Context, now time.Time, maint bool, primary
 	}
 	r.mu.Lock()
 	r.lastFail = now
-	r.deadTicks = 0
+	r.dead.reset()
 	r.mu.Unlock()
 	r.setDecision("failover: " + primary + " -> " + cand)
 	return dead
